@@ -50,7 +50,6 @@ SESSION_VM_FILE = BASE_DIR / "session-vm.json"
 
 # Per-request context set by MCPRouter
 _mcp_session_id: ContextVar[str] = ContextVar("mcp_session_id", default="")
-_mcp_client_ip: ContextVar[str] = ContextVar("mcp_client_ip", default="")
 
 log = logging.getLogger("fc_mcp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -103,11 +102,10 @@ _vm_state = VMState()
 # ─── Session → VM mapping ─────────────────────────────────────────────────────
 
 class SessionVMMap:
-    """Persisted mapping: mcp-session-id → vm_id, client-ip → vm_id."""
+    """Persisted mapping: mcp-session-id → vm_id."""
 
     def __init__(self):
-        self._session: Dict[str, str] = {}  # session_id → vm_id
-        self._ip: Dict[str, str] = {}       # client_ip  → vm_id
+        self._session: Dict[str, str] = {}
         self._load()
 
     def _load(self):
@@ -115,29 +113,23 @@ class SessionVMMap:
             try:
                 data = json.loads(SESSION_VM_FILE.read_text())
                 self._session = data.get("session", {})
-                self._ip = data.get("ip", {})
             except Exception:
                 pass
 
     def _save(self):
         SESSION_VM_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SESSION_VM_FILE.write_text(json.dumps(
-            {"session": self._session, "ip": self._ip}, indent=2
-        ))
+        SESSION_VM_FILE.write_text(json.dumps({"session": self._session}, indent=2))
 
-    def get(self, session_id: str, client_ip: str) -> Optional[str]:
-        return self._session.get(session_id) or self._ip.get(client_ip)
+    def get(self, session_id: str) -> Optional[str]:
+        return self._session.get(session_id)
 
-    def set(self, session_id: str, client_ip: str, vm_id: str):
+    def set(self, session_id: str, vm_id: str):
         if session_id:
             self._session[session_id] = vm_id
-        if client_ip:
-            self._ip[client_ip] = vm_id
-        self._save()
+            self._save()
 
     def remove(self, vm_id: str):
         self._session = {k: v for k, v in self._session.items() if v != vm_id}
-        self._ip = {k: v for k, v in self._ip.items() if v != vm_id}
         self._save()
 
 
@@ -308,16 +300,15 @@ async def _ssh_exec(vm_id: str, command: str, timeout: int = 60) -> Dict[str, An
 async def _resolve_session_vm() -> str:
     """Return a running vm_id for the current MCP session, creating or resuming as needed."""
     session_id = _mcp_session_id.get()
-    client_ip = _mcp_client_ip.get()
 
-    vm_id = _session_map.get(session_id, client_ip)
+    vm_id = _session_map.get(session_id)
     if vm_id:
         record = _vm_state.get(vm_id)
         if record:
             if record["status"] == "running":
                 return vm_id
             if record["status"] == "paused":
-                log.info(f"Auto-resuming VM {vm_id} for session {session_id or client_ip}")
+                log.info(f"Auto-resuming VM {vm_id} for session {session_id}")
                 snap = record.get("snapshot")
                 if not snap:
                     raise RuntimeError(f"VM {vm_id} is paused but has no snapshot.")
@@ -352,7 +343,7 @@ async def _resolve_session_vm() -> str:
                 return vm_id
 
     # No usable VM found — create a new one
-    log.info(f"Auto-creating VM for session {session_id or client_ip}")
+    log.info(f"Auto-creating VM for session {session_id}")
     new_vm_id = str(uuid.uuid4())
     name = f"vm-{new_vm_id[:8]}"
     # Ensure unique name
@@ -382,7 +373,7 @@ async def _resolve_session_vm() -> str:
         _vm_state.update(new_vm_id, {"status": "error", "error": str(e)})
         raise
 
-    _session_map.set(session_id, client_ip, new_vm_id)
+    _session_map.set(session_id, new_vm_id)
     return new_vm_id
 
 
@@ -508,9 +499,7 @@ class MCPRouter:
             headers = dict(scope.get("headers", []))
 
             session_id = headers.get(b"mcp-session-id", b"").decode()
-            client_ip = scope.get("client", ("", 0))[0]
             _mcp_session_id.set(session_id)
-            _mcp_client_ip.set(client_ip)
 
             scope["headers"] = [
                 (k, v) for k, v in scope.get("headers", []) if k.lower() != b"host"
