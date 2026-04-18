@@ -181,6 +181,9 @@ def _snapshot_dir(vm_id: str) -> Path:
     return SNAPSHOTS_DIR / vm_id
 
 def _vm_ip(vm_id: str) -> str:
+    record = _vm_state.get(vm_id)
+    if record and record.get("ip_address"):
+        return record["ip_address"]
     return f"172.16.0.{_vm_index(vm_id)}"
 
 def _vm_index(vm_id: str) -> int:
@@ -351,7 +354,7 @@ async def _resolve_session_vm() -> str:
     # No usable VM found — create a new one
     log.info(f"Auto-creating VM for session {session_id or client_ip}")
     new_vm_id = str(uuid.uuid4())
-    name = f"session-{(session_id or client_ip or new_vm_id)[:8]}"
+    name = f"vm-{new_vm_id[:8]}"
     # Ensure unique name
     existing_names = {v["name"] for v in _vm_state.list_all()}
     base, n = name, 1
@@ -359,10 +362,12 @@ async def _resolve_session_vm() -> str:
         name = f"{base}-{n}"
         n += 1
 
+    idx = len(_vm_state.list_all()) + 2
     ssh_port = VM_SSH_START_PORT + len(_vm_state.list_all())
     record = {
         "vm_id": new_vm_id, "name": name, "status": "creating",
         "vcpu": DEFAULT_VCPU, "mem_mb": DEFAULT_MEM_MB, "disk_mb": DEFAULT_DISK_MB,
+        "ip_address": f"172.16.0.{idx}",
         "ssh_port": ssh_port, "created_at": time.time(), "pid": None, "snapshot": None,
     }
     _vm_state.create(new_vm_id, record)
@@ -385,7 +390,7 @@ async def _resolve_session_vm() -> str:
 
 class VMCreateInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    name: str = Field(..., description="Human-readable label", min_length=1, max_length=64)
+    name: Optional[str] = Field(default=None, description="Human-readable label (auto-generated if omitted)", max_length=64)
     vcpu: int = Field(default=DEFAULT_VCPU, description="Number of vCPUs", ge=1, le=8)
     mem_mb: int = Field(default=DEFAULT_MEM_MB, description="RAM in MB", ge=128, le=8192)
     disk_mb: int = Field(default=DEFAULT_DISK_MB, description="Disk size in MB", ge=512, le=20480)
@@ -520,15 +525,18 @@ class MCPRouter:
 @api.post("/vms", status_code=201, tags=["VMs"], summary="Create a new microVM")
 async def api_vm_create(params: VMCreateInput):
     """Create and boot a new Firecracker microVM. Returns a `vm_id` to use with `bash_exec`."""
-    if any(v.get("name") == params.name for v in _vm_state.list_all()):
-        raise HTTPException(status_code=409, detail=f"VM named '{params.name}' already exists.")
-
     vm_id = str(uuid.uuid4())
+    name = params.name or f"vm-{vm_id[:8]}"
+    if any(v.get("name") == name for v in _vm_state.list_all()):
+        raise HTTPException(status_code=409, detail=f"VM named '{name}' already exists.")
+
+    idx = len(_vm_state.list_all()) + 2
     ssh_port = VM_SSH_START_PORT + len(_vm_state.list_all())
     record = {
-        "vm_id": vm_id, "name": params.name, "status": "creating",
+        "vm_id": vm_id, "name": name, "status": "creating",
         "vcpu": params.vcpu, "mem_mb": params.mem_mb, "disk_mb": params.disk_mb,
-        "ssh_port": ssh_port, "created_at": time.time(), "pid": None, "snapshots": [],
+        "ip_address": f"172.16.0.{idx}",
+        "ssh_port": ssh_port, "created_at": time.time(), "pid": None, "snapshot": None,
     }
     _vm_state.create(vm_id, record)
 
@@ -542,7 +550,7 @@ async def api_vm_create(params: VMCreateInput):
             raise HTTPException(status_code=500, detail="VM booted but SSH never became available.")
         _vm_state.update(vm_id, {"status": "running"})
         return {
-            "vm_id": vm_id, "name": params.name, "status": "running",
+            "vm_id": vm_id, "name": name, "status": "running",
             "ssh_port": ssh_port, "ip_address": f"172.16.0.{_vm_index(vm_id)}",
             "vcpu": params.vcpu, "mem_mb": params.mem_mb, "disk_mb": params.disk_mb,
         }
