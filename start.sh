@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# scripts/start.sh
+# Generates SSH keys (if needed) and starts the MCP server.
+set -euo pipefail
+
+BASE_DIR="${FC_BASE_DIR:-/opt/fc-mcp}"
+SSH_KEY="$BASE_DIR/vm_ssh_key"
+MCP_PORT="${MCP_PORT:-8080}"
+MCP_HOST="${MCP_HOST:-0.0.0.0}"
+
+mkdir -p "$BASE_DIR"/{vm-images,snapshots,sockets,overlays}
+
+# ── SSH key for VM access ──────────────────────────────────────────────────────
+if [[ ! -f "$SSH_KEY" ]]; then
+    echo "==> Generating SSH key for VM access..."
+    ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "fc-mcp-vm-access"
+    echo "✅ SSH key generated at $SSH_KEY"
+fi
+
+# ── Preflight checks ──────────────────────────────────────────────────────────
+echo "==> Checking prerequisites..."
+
+if [[ ! -f /dev/kvm ]]; then
+    echo "⚠️  WARNING: /dev/kvm not found. Firecracker requires KVM."
+    echo "   On EC2: use a metal instance or instance with nested virt support"
+    echo "   On bare metal: ensure VT-x/AMD-V is enabled in BIOS"
+fi
+
+KERNEL="$BASE_DIR/vm-images/vmlinux-5.10"
+ROOTFS="$BASE_DIR/vm-images/ubuntu-22.04-base.ext4"
+
+if [[ ! -f "$KERNEL" ]]; then
+    echo "❌ Kernel not found at $KERNEL"
+    echo "   Run: scripts/build-kernel.sh"
+    exit 1
+fi
+
+if [[ ! -f "$ROOTFS" ]]; then
+    echo "❌ Rootfs not found at $ROOTFS"
+    echo "   Run: sudo scripts/build-rootfs.sh"
+    exit 1
+fi
+
+if ! command -v firecracker &>/dev/null && [[ ! -f /usr/bin/firecracker ]]; then
+    echo "❌ firecracker binary not found"
+    echo "   Install: https://github.com/firecracker-microvm/firecracker/releases"
+    exit 1
+fi
+
+echo "✅ All checks passed"
+
+# ── Start MCP server ──────────────────────────────────────────────────────────
+echo ""
+echo "==> Starting Firecracker Bash MCP Server"
+echo "    Host: $MCP_HOST:$MCP_PORT"
+echo "    Base dir: $BASE_DIR"
+echo ""
+
+export FC_BASE_DIR="$BASE_DIR"
+exec python3 "$(dirname "$0")/../src/server.py" --host "$MCP_HOST" --port "$MCP_PORT"

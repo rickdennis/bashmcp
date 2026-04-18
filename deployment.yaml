@@ -1,0 +1,166 @@
+# kubernetes/deployment.yaml
+# Deploys the Firecracker Bash MCP server on a Kubernetes node with KVM access.
+#
+# REQUIREMENTS:
+#   - Node must have /dev/kvm available (bare metal or nested virt)
+#   - Node must have sufficient disk for VM images + overlays
+#   - Recommended: dedicated node pool labeled with fc-mcp=true
+#
+# USAGE:
+#   kubectl apply -f kubernetes/
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fc-mcp
+
+---
+# PersistentVolume for VM images, overlays, and snapshots
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fc-mcp-data
+  namespace: fc-mcp
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi  # Adjust: ~2GB base image + ~2GB per VM + snapshots
+  storageClassName: fast-ssd  # Use a fast storage class; adjust for your cluster
+
+---
+# Secret for MCP auth token (optional but recommended)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fc-mcp-auth
+  namespace: fc-mcp
+type: Opaque
+stringData:
+  MCP_AUTH_TOKEN: "change-me-strong-token"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fc-bash-mcp
+  namespace: fc-mcp
+  labels:
+    app: fc-bash-mcp
+spec:
+  replicas: 1  # Single replica — VMs are local to this pod
+  selector:
+    matchLabels:
+      app: fc-bash-mcp
+  template:
+    metadata:
+      labels:
+        app: fc-bash-mcp
+    spec:
+      # Schedule on nodes with KVM access
+      nodeSelector:
+        fc-mcp: "true"
+
+      # Host network for tap device visibility
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      # Must be privileged for KVM + tap networking
+      securityContext:
+        runAsUser: 0
+
+      initContainers:
+        # Set up host network bridges (runs once before main container)
+        - name: network-setup
+          image: fc-bash-mcp:latest
+          command: ["scripts/setup-network.sh"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: fc-data
+              mountPath: /opt/fc-mcp
+
+      containers:
+        - name: fc-bash-mcp
+          image: fc-bash-mcp:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - containerPort: 8080
+              name: mcp-http
+
+          env:
+            - name: FC_BASE_DIR
+              value: /opt/fc-mcp
+            - name: MCP_PORT
+              value: "8080"
+            - name: MCP_HOST
+              value: "0.0.0.0"
+
+          envFrom:
+            - secretRef:
+                name: fc-mcp-auth
+
+          securityContext:
+            privileged: true  # Required for KVM and tap devices
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+              # Note: VM memory comes from host, not these limits
+
+          volumeMounts:
+            - name: fc-data
+              mountPath: /opt/fc-mcp
+            - name: kvm
+              mountPath: /dev/kvm
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+      volumes:
+        - name: fc-data
+          persistentVolumeClaim:
+            claimName: fc-mcp-data
+        - name: kvm
+          hostPath:
+            path: /dev/kvm
+            type: CharDevice
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fc-bash-mcp
+  namespace: fc-mcp
+spec:
+  selector:
+    app: fc-bash-mcp
+  ports:
+    - name: mcp-http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP  # Use LoadBalancer or Ingress to expose externally
