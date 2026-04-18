@@ -15,6 +15,7 @@ import time
 import uuid
 import logging
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -45,6 +46,11 @@ DEFAULT_DISK_MB = 2048
 VM_SSH_START_PORT = 50000
 
 SSH_KEY_PATH = BASE_DIR / "vm_ssh_key"
+SESSION_VM_FILE = BASE_DIR / "session-vm.json"
+
+# Per-request context set by MCPRouter
+_mcp_session_id: ContextVar[str] = ContextVar("mcp_session_id", default="")
+_mcp_client_ip: ContextVar[str] = ContextVar("mcp_client_ip", default="")
 
 log = logging.getLogger("fc_mcp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -92,6 +98,50 @@ class VMState:
 
 
 _vm_state = VMState()
+
+
+# ─── Session → VM mapping ─────────────────────────────────────────────────────
+
+class SessionVMMap:
+    """Persisted mapping: mcp-session-id → vm_id, client-ip → vm_id."""
+
+    def __init__(self):
+        self._session: Dict[str, str] = {}  # session_id → vm_id
+        self._ip: Dict[str, str] = {}       # client_ip  → vm_id
+        self._load()
+
+    def _load(self):
+        if SESSION_VM_FILE.exists():
+            try:
+                data = json.loads(SESSION_VM_FILE.read_text())
+                self._session = data.get("session", {})
+                self._ip = data.get("ip", {})
+            except Exception:
+                pass
+
+    def _save(self):
+        SESSION_VM_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SESSION_VM_FILE.write_text(json.dumps(
+            {"session": self._session, "ip": self._ip}, indent=2
+        ))
+
+    def get(self, session_id: str, client_ip: str) -> Optional[str]:
+        return self._session.get(session_id) or self._ip.get(client_ip)
+
+    def set(self, session_id: str, client_ip: str, vm_id: str):
+        if session_id:
+            self._session[session_id] = vm_id
+        if client_ip:
+            self._ip[client_ip] = vm_id
+        self._save()
+
+    def remove(self, vm_id: str):
+        self._session = {k: v for k, v in self._session.items() if v != vm_id}
+        self._ip = {k: v for k, v in self._ip.items() if v != vm_id}
+        self._save()
+
+
+_session_map = SessionVMMap()
 
 
 # ─── Firecracker API Client ────────────────────────────────────────────────────
@@ -252,6 +302,85 @@ async def _ssh_exec(vm_id: str, command: str, timeout: int = 60) -> Dict[str, An
         return {"stdout": "", "stderr": "Command timed out", "returncode": -1}
 
 
+async def _resolve_session_vm() -> str:
+    """Return a running vm_id for the current MCP session, creating or resuming as needed."""
+    session_id = _mcp_session_id.get()
+    client_ip = _mcp_client_ip.get()
+
+    vm_id = _session_map.get(session_id, client_ip)
+    if vm_id:
+        record = _vm_state.get(vm_id)
+        if record:
+            if record["status"] == "running":
+                return vm_id
+            if record["status"] == "paused":
+                log.info(f"Auto-resuming VM {vm_id} for session {session_id or client_ip}")
+                snap = record.get("snapshot")
+                if not snap:
+                    raise RuntimeError(f"VM {vm_id} is paused but has no snapshot.")
+                socket = _socket_path(vm_id)
+                if Path(socket).exists():
+                    Path(socket).unlink()
+                vsock = SOCKETS_DIR / f"{vm_id}-vsock.sock"
+                if vsock.exists():
+                    vsock.unlink()
+                fc_proc = subprocess.Popen(
+                    [FC_BINARY, "--api-sock", socket, "--level", "Warning"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                _vm_state.update(vm_id, {"pid": fc_proc.pid})
+                for _ in range(30):
+                    if Path(socket).exists():
+                        break
+                    await asyncio.sleep(0.2)
+                else:
+                    fc_proc.kill()
+                    raise RuntimeError("Firecracker socket never appeared on auto-resume")
+                fc = FirecrackerClient(socket)
+                try:
+                    await fc.put("/snapshot/load", {
+                        "snapshot_path": snap["state_path"], "mem_file_path": snap["mem_path"],
+                        "enable_diff_snapshots": False, "resume_vm": True,
+                    })
+                finally:
+                    await fc.close()
+                await _wait_for_ssh(vm_id, timeout=30)
+                _vm_state.update(vm_id, {"status": "running"})
+                return vm_id
+
+    # No usable VM found — create a new one
+    log.info(f"Auto-creating VM for session {session_id or client_ip}")
+    new_vm_id = str(uuid.uuid4())
+    name = f"session-{(session_id or client_ip or new_vm_id)[:8]}"
+    # Ensure unique name
+    existing_names = {v["name"] for v in _vm_state.list_all()}
+    base, n = name, 1
+    while name in existing_names:
+        name = f"{base}-{n}"
+        n += 1
+
+    ssh_port = VM_SSH_START_PORT + len(_vm_state.list_all())
+    record = {
+        "vm_id": new_vm_id, "name": name, "status": "creating",
+        "vcpu": DEFAULT_VCPU, "mem_mb": DEFAULT_MEM_MB, "disk_mb": DEFAULT_DISK_MB,
+        "ssh_port": ssh_port, "created_at": time.time(), "pid": None, "snapshot": None,
+    }
+    _vm_state.create(new_vm_id, record)
+    try:
+        await _create_overlay(new_vm_id, DEFAULT_DISK_MB)
+        pid = await _launch_firecracker(new_vm_id, DEFAULT_VCPU, DEFAULT_MEM_MB)
+        _vm_state.update(new_vm_id, {"pid": pid, "status": "booting"})
+        if not await _wait_for_ssh(new_vm_id, timeout=45):
+            raise RuntimeError("SSH never became available after VM boot")
+        _vm_state.update(new_vm_id, {"status": "running"})
+    except Exception as e:
+        _vm_state.update(new_vm_id, {"status": "error", "error": str(e)})
+        raise
+
+    _session_map.set(session_id, client_ip, new_vm_id)
+    return new_vm_id
+
+
 # ─── Pydantic Models ───────────────────────────────────────────────────────────
 
 class VMCreateInput(BaseModel):
@@ -266,7 +395,7 @@ class VMCreateInput(BaseModel):
 
 class BashExecInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    vm_id: str = Field(..., description="VM ID returned by POST /vms")
+    vm_id: Optional[str] = Field(default=None, description="VM ID. If omitted, auto-creates or resumes the VM for this MCP session.")
     command: str = Field(..., description="Shell command to execute (runs as root)", min_length=1, max_length=8192)
     timeout: int = Field(default=60, description="Max seconds to wait", ge=1, le=600)
     working_dir: Optional[str] = Field(default=None, description="Working directory inside the VM")
@@ -297,7 +426,7 @@ async def bash_exec(params: BashExecInput) -> str:
 
     Args:
         params (BashExecInput):
-            - vm_id (str): Target VM ID (from POST /vms)
+            - vm_id (Optional[str]): Target VM ID. If omitted, auto-creates or resumes the session VM.
             - command (str): Bash command to run
             - timeout (int): Max seconds to wait (default: 60, max: 600)
             - working_dir (Optional[str]): Working directory inside VM
@@ -305,9 +434,14 @@ async def bash_exec(params: BashExecInput) -> str:
     Returns:
         str: JSON with stdout, stderr, returncode, and elapsed_seconds
     """
-    record = _vm_state.get(params.vm_id)
+    try:
+        vm_id = params.vm_id or await _resolve_session_vm()
+    except Exception as e:
+        return json.dumps({"error": f"Could not resolve VM for session: {e}"})
+
+    record = _vm_state.get(vm_id)
     if not record:
-        return json.dumps({"error": f"VM '{params.vm_id}' not found."})
+        return json.dumps({"error": f"VM '{vm_id}' not found."})
     if record["status"] != "running":
         return json.dumps({
             "error": f"VM is not running (status: {record['status']}). "
@@ -319,11 +453,11 @@ async def bash_exec(params: BashExecInput) -> str:
         command = f"cd {params.working_dir} && {command}"
 
     start = time.time()
-    result = await _ssh_exec(params.vm_id, command, timeout=params.timeout)
+    result = await _ssh_exec(vm_id, command, timeout=params.timeout)
     elapsed = round(time.time() - start, 2)
 
     return json.dumps({
-        "vm_id": params.vm_id,
+        "vm_id": vm_id,
         "command": params.command,
         "stdout": result["stdout"],
         "stderr": result["stderr"],
@@ -366,6 +500,13 @@ class MCPRouter:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope.get("path", "").rstrip("/") == "/mcp":
             scope = dict(scope)
+            headers = dict(scope.get("headers", []))
+
+            session_id = headers.get(b"mcp-session-id", b"").decode()
+            client_ip = scope.get("client", ("", 0))[0]
+            _mcp_session_id.set(session_id)
+            _mcp_client_ip.set(client_ip)
+
             scope["headers"] = [
                 (k, v) for k, v in scope.get("headers", []) if k.lower() != b"host"
             ] + [(b"host", b"localhost")]
@@ -579,6 +720,7 @@ async def api_vm_destroy(vm_id: str):
         shutil.rmtree(snap_dir)
 
     _vm_state.delete(vm_id)
+    _session_map.remove(vm_id)
     return {"vm_id": vm_id, "name": record["name"], "status": "destroyed"}
 
 
