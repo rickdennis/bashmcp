@@ -38,6 +38,7 @@ echo "root:firecracker" | chroot "$MOUNT_DIR" chpasswd
 echo "fc-vm" > "$MOUNT_DIR/etc/hostname"
 
 # Network config (eth0 with static IP set by kernel cmdline)
+mkdir -p "$MOUNT_DIR/etc/network"
 cat > "$MOUNT_DIR/etc/network/interfaces" <<'EOF'
 auto lo
 iface lo inet loopback
@@ -66,6 +67,7 @@ chroot "$MOUNT_DIR" systemctl disable apt-daily.service apt-daily-upgrade.servic
     unattended-upgrades.service systemd-timesyncd.service 2>/dev/null || true
 
 # Fast serial console getty
+mkdir -p "$MOUNT_DIR/etc/systemd/system/serial-getty@ttyS0.service.d"
 cat > "$MOUNT_DIR/etc/systemd/system/serial-getty@ttyS0.service.d/override.conf" <<'EOF'
 [Service]
 ExecStart=

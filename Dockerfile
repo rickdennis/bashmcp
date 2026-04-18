@@ -1,6 +1,4 @@
-# Dockerfile
-# Runs the MCP server itself (NOT the VMs — those run directly on the host via Firecracker).
-# The container must be run with --privileged and /dev/kvm mounted for Firecracker to work.
+# Runs the MCP+REST server. Requires --privileged and /dev/kvm for Firecracker.
 #
 # Usage:
 #   docker build -t fc-bash-mcp .
@@ -20,6 +18,9 @@ RUN apt-get update && apt-get install -y \
     e2fsprogs \
     && rm -rf /var/lib/apt/lists/*
 
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
 # Install Firecracker
 ARG FC_VERSION=v1.10.1
 RUN ARCH=$(uname -m) && \
@@ -32,12 +33,11 @@ RUN ARCH=$(uname -m) && \
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
 
-COPY src/ ./src/
-COPY scripts/ ./scripts/
-RUN chmod +x scripts/*.sh
+COPY server.py start.sh ./
+RUN chmod +x start.sh
 
 ENV FC_BASE_DIR=/opt/fc-mcp
 ENV MCP_PORT=8080
@@ -45,4 +45,4 @@ ENV MCP_HOST=0.0.0.0
 
 EXPOSE 8080
 
-ENTRYPOINT ["scripts/start.sh"]
+ENTRYPOINT ["./start.sh"]

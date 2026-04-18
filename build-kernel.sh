@@ -34,7 +34,7 @@ else
 
     # AWS provides pre-built kernels for Firecracker
     # This is the recommended 5.10 kernel from the Firecracker team
-    KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-5.10.225"
+    KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.9/x86_64/vmlinux-5.10.225"
 
     echo "Downloading from: $KERNEL_URL"
     wget -q --show-progress "$KERNEL_URL" -O "$KERNEL"

@@ -20,10 +20,14 @@ fi
 # ── Preflight checks ──────────────────────────────────────────────────────────
 echo "==> Checking prerequisites..."
 
-if [[ ! -f /dev/kvm ]]; then
-    echo "⚠️  WARNING: /dev/kvm not found. Firecracker requires KVM."
+if [[ ! -e /dev/kvm ]]; then
+    echo "❌ /dev/kvm not found. Firecracker requires KVM."
     echo "   On EC2: use a metal instance or instance with nested virt support"
     echo "   On bare metal: ensure VT-x/AMD-V is enabled in BIOS"
+    echo "   On Proxmox/VMware/VirtualBox: enable nested virtualization on the hypervisor"
+    echo ""
+    echo "   Try: sudo modprobe kvm_intel  (or kvm_amd)"
+    exit 1
 fi
 
 KERNEL="$BASE_DIR/vm-images/vmlinux-5.10"
@@ -57,4 +61,4 @@ echo "    Base dir: $BASE_DIR"
 echo ""
 
 export FC_BASE_DIR="$BASE_DIR"
-exec python3 "$(dirname "$0")/../src/server.py" --host "$MCP_HOST" --port "$MCP_PORT"
+exec uv run python "$(dirname "$0")/server.py" --host "$MCP_HOST" --port "$MCP_PORT"
