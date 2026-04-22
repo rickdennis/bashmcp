@@ -15,7 +15,6 @@ import time
 import uuid
 import logging
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -48,8 +47,6 @@ VM_SSH_START_PORT = 50000
 SSH_KEY_PATH = BASE_DIR / "vm_ssh_key"
 SESSION_VM_FILE = BASE_DIR / "session-vm.json"
 
-# Per-request context set by MCPRouter
-_mcp_session_id: ContextVar[str] = ContextVar("mcp_session_id", default="")
 
 log = logging.getLogger("fc_mcp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -297,9 +294,9 @@ async def _ssh_exec(vm_id: str, command: str, timeout: int = 60) -> Dict[str, An
         return {"stdout": "", "stderr": "Command timed out", "returncode": -1}
 
 
-async def _resolve_session_vm() -> str:
+async def _resolve_session_vm(session_id: str) -> str:
     """Return a running vm_id for the current MCP session, creating or resuming as needed."""
-    session_id = _mcp_session_id.get()
+    log.info(f"_resolve_session_vm: session_id={repr(session_id)} map={_session_map._session}")
 
     vm_id = _session_map.get(session_id)
     if vm_id:
@@ -417,7 +414,7 @@ mcp = FastMCP(
         "openWorldHint": False,
     }
 )
-async def bash_exec(params: BashExecInput) -> str:
+async def bash_exec(params: BashExecInput, ctx: Context) -> str:
     """Run a shell command as root inside a running Firecracker microVM via SSH.
 
     Args:
@@ -431,7 +428,8 @@ async def bash_exec(params: BashExecInput) -> str:
         str: JSON with stdout, stderr, returncode, and elapsed_seconds
     """
     try:
-        vm_id = params.vm_id or await _resolve_session_vm()
+        session_key = str(id(ctx.request_context.session))
+        vm_id = params.vm_id or await _resolve_session_vm(session_key)
     except Exception as e:
         return json.dumps({"error": f"Could not resolve VM for session: {e}"})
 
@@ -496,15 +494,26 @@ class MCPRouter:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope.get("path", "").rstrip("/") == "/mcp":
             scope = dict(scope)
-            headers = dict(scope.get("headers", []))
 
-            session_id = headers.get(b"mcp-session-id", b"").decode()
-            _mcp_session_id.set(session_id)
+            # Log full request body for initialize requests to find stable identifiers
+            body_chunks = []
+            async def receive_logging():
+                msg = await receive()
+                if msg["type"] == "http.request":
+                    body_chunks.append(msg.get("body", b""))
+                    try:
+                        parsed = json.loads(b"".join(body_chunks))
+                        if parsed.get("method") == "initialize":
+                            log.info(f"MCP initialize body: {json.dumps(parsed)}")
+                            log.info(f"MCP initialize headers: { {k.decode():v.decode() for k,v in scope.get('headers',[])} }")
+                    except Exception:
+                        pass
+                return msg
 
             scope["headers"] = [
                 (k, v) for k, v in scope.get("headers", []) if k.lower() != b"host"
             ] + [(b"host", b"localhost")]
-            await self.mcp_handler(scope, receive, send)
+            await self.mcp_handler(scope, receive_logging, send)
         else:
             await self.api_app(scope, receive, send)
 
