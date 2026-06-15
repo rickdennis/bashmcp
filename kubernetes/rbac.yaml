@@ -1,0 +1,82 @@
+# RBAC for the two control-plane roles. Both are namespace-scoped (least privilege);
+# the privileged, hostNetwork node-agent gets no cluster-wide or core-resource writes.
+
+---
+# Node-agent: publishes its own NodeAgent CR (identity + capacity + heartbeat).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fc-node-agent
+  namespace: fc-mcp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fc-node-agent
+  namespace: fc-mcp
+rules:
+  - apiGroups: ["fcmcp.io"]
+    resources: ["nodeagents"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["fcmcp.io"]
+    resources: ["nodeagents/status"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fc-node-agent
+  namespace: fc-mcp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fc-node-agent
+subjects:
+  - kind: ServiceAccount
+    name: fc-node-agent
+    namespace: fc-mcp
+
+---
+# Router: reads NodeAgents (capacity), owns Sessions (placement/binding), and
+# uses a Lease for leader election. May mark a dead node's NodeAgent Gone.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fc-mcp-router
+  namespace: fc-mcp
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fc-mcp-router
+  namespace: fc-mcp
+rules:
+  - apiGroups: ["fcmcp.io"]
+    resources: ["sessions"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["fcmcp.io"]
+    resources: ["sessions/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["fcmcp.io"]
+    resources: ["nodeagents"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["fcmcp.io"]
+    resources: ["nodeagents/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fc-mcp-router
+  namespace: fc-mcp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fc-mcp-router
+subjects:
+  - kind: ServiceAccount
+    name: fc-mcp-router
+    namespace: fc-mcp

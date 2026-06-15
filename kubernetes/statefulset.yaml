@@ -1,0 +1,121 @@
+# Node-agent StatefulSet: exactly one pod per node on the tainted fc-mcp pool.
+#
+# Hard podAntiAffinity (one per node) gives the single-process-per-node invariant the
+# code relies on; a local-PV volumeClaimTemplate pins each pod to its node's disk.
+# Set `replicas` to the node count of the fc-mcp pool.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: fc-node-agent
+  namespace: fc-mcp
+  labels:
+    app: fc-node-agent
+spec:
+  serviceName: fc-node          # the headless Service
+  replicas: 2                   # == number of nodes in the fc-mcp pool (adjust)
+  podManagementPolicy: Parallel # nodes are independent; no ordering dependency
+  updateStrategy:
+    type: OnDelete              # upgrades are deliberate (each restart bounces a node's VMs)
+  selector:
+    matchLabels:
+      app: fc-node-agent
+  template:
+    metadata:
+      labels:
+        app: fc-node-agent
+    spec:
+      serviceAccountName: fc-node-agent
+      nodeSelector:
+        fc-mcp: "true"
+      tolerations:
+        - key: fc-mcp
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:         # at most one node-agent per node
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: fc-node-agent
+              topologyKey: kubernetes.io/hostname
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 120   # room for preStop drain (pause+snapshot)
+      securityContext:
+        runAsUser: 0
+      initContainers:
+        - name: network-setup
+          image: fc-bash-mcp:latest
+          command: ["bash", "setup-network.sh"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: fc-data
+              mountPath: /opt/fc-mcp
+      containers:
+        - name: fc-node-agent
+          image: fc-bash-mcp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: FC_BASE_DIR
+              value: /opt/fc-mcp
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_IP            # hostNetwork: this is the node IP the router POSTs to
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: FC_MCP_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: FC_MAX_VMS
+              value: "32"            # must match the tap count in setup-network.sh
+          securityContext:
+            privileged: true         # KVM + tap devices
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "curl -s -X POST http://localhost:8080/drain || true"]
+          startupProbe:              # generous: first boot may build/copy images
+            httpGet: {path: /health, port: 8080}
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:            # 503 when full / not reconciled -> no new placement
+            httpGet: {path: /ready, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: {cpu: "500m", memory: "256Mi"}
+            limits: {cpu: "2", memory: "1Gi"}  # VM memory comes from the host, not here
+          volumeMounts:
+            - name: fc-data
+              mountPath: /opt/fc-mcp
+            - name: kvm
+              mountPath: /dev/kvm
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+      volumes:
+        - name: kvm
+          hostPath: {path: /dev/kvm, type: CharDevice}
+        - name: dev-net-tun
+          hostPath: {path: /dev/net/tun, type: CharDevice}
+  volumeClaimTemplates:
+    - metadata:
+        name: fc-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: fc-local
+        resources:
+          requests:
+            storage: 100Gi

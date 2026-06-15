@@ -15,6 +15,7 @@ import time
 import uuid
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -42,10 +43,19 @@ FC_BINARY = os.environ.get("FC_BINARY", "/usr/bin/firecracker")
 DEFAULT_VCPU = 2
 DEFAULT_MEM_MB = 512
 DEFAULT_DISK_MB = 2048
-VM_SSH_START_PORT = 50000
 
 SSH_KEY_PATH = BASE_DIR / "vm_ssh_key"
 SESSION_VM_FILE = BASE_DIR / "session-vm.json"
+SLOTS_FILE = BASE_DIR / "slots.json"
+
+# A VM's slot index determines its bridge IP (172.16.0.{slot}) and tap device
+# (fc-tap-{slot-2:08x}). setup-network.sh pre-creates 32 taps, so slots run
+# SLOT_MIN..SLOT_MAX inclusive (32 values); the tap count is the hard cap.
+SLOT_MIN = 2
+SLOT_MAX = 33
+
+# Node identity (Kubernetes downward API spec.nodeName); empty when run standalone.
+NODE_NAME = os.environ.get("NODE_NAME", "")
 
 
 log = logging.getLogger("fc_mcp")
@@ -133,6 +143,79 @@ class SessionVMMap:
 _session_map = SessionVMMap()
 
 
+# ─── Slot Allocator (IP / tap index) ───────────────────────────────────────────
+
+class SlotAllocator:
+    """Persistent node-local free-list of VM slot indices (SLOT_MIN..SLOT_MAX).
+
+    A slot is allocated once and stored on the VM record, so destroying one VM
+    never shifts another's IP/tap. This replaces the old positional indexing
+    (``len(list_all()) + 2``), which drifted a survivor's tap/boot-IP away from
+    its frozen stored IP whenever an earlier VM was destroyed.
+    """
+
+    def __init__(self):
+        self._used: set = set()
+        self._free: List[int] = list(range(SLOT_MIN, SLOT_MAX + 1))
+        self._load()
+
+    def _load(self):
+        if SLOTS_FILE.exists():
+            try:
+                data = json.loads(SLOTS_FILE.read_text())
+                self.rebuild_from_records(data.get("used", []))
+            except Exception as e:
+                log.warning(f"Could not load slots file: {e}")
+
+    def _save(self):
+        SLOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SLOTS_FILE.write_text(json.dumps({"used": sorted(self._used)}, indent=2))
+
+    def rebuild_from_records(self, in_use: List[int]):
+        """Authoritatively reset the free-list from a list of in-use slots."""
+        self._used = {s for s in in_use if s is not None and SLOT_MIN <= s <= SLOT_MAX}
+        self._free = [i for i in range(SLOT_MIN, SLOT_MAX + 1) if i not in self._used]
+        self._save()
+
+    def allocate(self) -> Optional[int]:
+        if not self._free:
+            return None
+        slot = self._free.pop(0)
+        self._used.add(slot)
+        self._save()
+        return slot
+
+    def reserve(self, slot: Optional[int]):
+        if slot is None or not (SLOT_MIN <= slot <= SLOT_MAX):
+            return
+        if slot in self._free:
+            self._free.remove(slot)
+        self._used.add(slot)
+        self._save()
+
+    def release(self, slot: Optional[int]):
+        if slot is None or not (SLOT_MIN <= slot <= SLOT_MAX):
+            return
+        self._used.discard(slot)
+        if slot not in self._free:
+            self._free.append(slot)
+            self._free.sort()
+        self._save()
+
+    def free_count(self) -> int:
+        return len(self._free)
+
+
+_slots = SlotAllocator()
+
+# Guards slot allocation + state-record creation so interleaved awaits in a single
+# process cannot double-issue a slot or corrupt the registry (no locking existed before).
+_create_lock = asyncio.Lock()
+
+# Flipped True by reconcile_on_startup(); gates the /ready probe.
+_ready = False
+
+
 # ─── Firecracker API Client ────────────────────────────────────────────────────
 
 class FirecrackerClient:
@@ -169,21 +252,63 @@ def _socket_path(vm_id: str) -> str:
 def _snapshot_dir(vm_id: str) -> Path:
     return SNAPSHOTS_DIR / vm_id
 
+def _record_slot(record: Optional[Dict]) -> Optional[int]:
+    """The VM's stored slot, or derived from its stored IP for legacy records."""
+    if not record:
+        return None
+    if record.get("slot") is not None:
+        return record["slot"]
+    ip = record.get("ip_address")
+    if ip:
+        try:
+            return int(ip.rsplit(".", 1)[1])
+        except (ValueError, IndexError):
+            return None
+    return None
+
 def _vm_ip(vm_id: str) -> str:
     record = _vm_state.get(vm_id)
     if record and record.get("ip_address"):
         return record["ip_address"]
-    return f"172.16.0.{_vm_index(vm_id)}"
+    slot = _record_slot(record)
+    return f"172.16.0.{slot if slot is not None else SLOT_MIN}"
 
-def _vm_index(vm_id: str) -> int:
-    for i, v in enumerate(_vm_state.list_all()):
-        if v["vm_id"] == vm_id:
-            return i + 2
-    return 2
+def _vm_tap(vm_id: str) -> str:
+    slot = _record_slot(_vm_state.get(vm_id))
+    if slot is None:
+        slot = SLOT_MIN
+    return f"fc-tap-{(slot - SLOT_MIN):08x}"
 
 def _gen_mac(vm_id: str) -> str:
     h = vm_id.replace("-", "")[:10]
     return f"AA:FC:{h[0:2]}:{h[2:4]}:{h[4:6]}:{h[6:8]}"
+
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but not ours — still alive
+
+def _pid_is_firecracker(pid: Optional[int]) -> bool:
+    """Alive AND actually a firecracker process (guards against PID reuse).
+
+    On Linux uses /proc/<pid>/comm; off-Linux (dev) falls back to liveness only.
+    """
+    if not _pid_alive(pid):
+        return False
+    comm = Path(f"/proc/{pid}/comm")
+    if comm.exists():
+        try:
+            return comm.read_text().strip() == "firecracker"
+        except Exception:
+            return False
+    return True
 
 
 async def _create_overlay(vm_id: str, size_mb: int):
@@ -226,7 +351,7 @@ async def _launch_firecracker(vm_id: str, vcpu: int, mem_mb: int) -> int:
             "kernel_image_path": str(KERNEL_IMAGE),
             "boot_args": (
                 f"console=ttyS0 reboot=k panic=1 pci=off "
-                f"ip=172.16.0.{_vm_index(vm_id)}::172.16.0.1:255.255.255.0::eth0:off "
+                f"ip={_vm_ip(vm_id)}::172.16.0.1:255.255.255.0::eth0:off "
             )
         })
         await fc.put("/drives/rootfs", {
@@ -239,7 +364,7 @@ async def _launch_firecracker(vm_id: str, vcpu: int, mem_mb: int) -> int:
         await fc.put("/network-interfaces/eth0", {
             "iface_id": "eth0",
             "guest_mac": _gen_mac(vm_id),
-            "host_dev_name": f"fc-tap-{(_vm_index(vm_id) - 2):08x}"
+            "host_dev_name": _vm_tap(vm_id)
         })
         await fc.put("/vsock", {
             "guest_cid": 3,
@@ -294,6 +419,29 @@ async def _ssh_exec(vm_id: str, command: str, timeout: int = 60) -> Dict[str, An
         return {"stdout": "", "stderr": "Command timed out", "returncode": -1}
 
 
+async def _allocate_and_create_record(vm_id: str, name: str, vcpu: int, mem_mb: int, disk_mb: int) -> Dict:
+    """Atomically allocate a slot and persist a 'creating' record.
+
+    Raises RuntimeError("node at capacity") when every slot is in use, or
+    ValueError on a duplicate name. Held under _create_lock so interleaved
+    awaits in this single process cannot double-issue a slot.
+    """
+    async with _create_lock:
+        if any(v.get("name") == name for v in _vm_state.list_all()):
+            raise ValueError(f"VM named '{name}' already exists.")
+        slot = _slots.allocate()
+        if slot is None:
+            raise RuntimeError(f"node at capacity: all {SLOT_MAX - SLOT_MIN + 1} VM slots in use")
+        record = {
+            "vm_id": vm_id, "name": name, "status": "creating",
+            "vcpu": vcpu, "mem_mb": mem_mb, "disk_mb": disk_mb,
+            "slot": slot, "ip_address": f"172.16.0.{slot}",
+            "created_at": time.time(), "pid": None, "snapshot": None,
+        }
+        _vm_state.create(vm_id, record)
+    return record
+
+
 async def _resolve_session_vm(session_id: str) -> str:
     """Return a running vm_id for the current MCP session, creating or resuming as needed."""
     log.info(f"_resolve_session_vm: session_id={repr(session_id)} map={_session_map._session}")
@@ -343,22 +491,8 @@ async def _resolve_session_vm(session_id: str) -> str:
     log.info(f"Auto-creating VM for session {session_id}")
     new_vm_id = str(uuid.uuid4())
     name = f"vm-{new_vm_id[:8]}"
-    # Ensure unique name
-    existing_names = {v["name"] for v in _vm_state.list_all()}
-    base, n = name, 1
-    while name in existing_names:
-        name = f"{base}-{n}"
-        n += 1
 
-    idx = len(_vm_state.list_all()) + 2
-    ssh_port = VM_SSH_START_PORT + len(_vm_state.list_all())
-    record = {
-        "vm_id": new_vm_id, "name": name, "status": "creating",
-        "vcpu": DEFAULT_VCPU, "mem_mb": DEFAULT_MEM_MB, "disk_mb": DEFAULT_DISK_MB,
-        "ip_address": f"172.16.0.{idx}",
-        "ssh_port": ssh_port, "created_at": time.time(), "pid": None, "snapshot": None,
-    }
-    _vm_state.create(new_vm_id, record)
+    await _allocate_and_create_record(new_vm_id, name, DEFAULT_VCPU, DEFAULT_MEM_MB, DEFAULT_DISK_MB)
     try:
         await _create_overlay(new_vm_id, DEFAULT_DISK_MB)
         pid = await _launch_firecracker(new_vm_id, DEFAULT_VCPU, DEFAULT_MEM_MB)
@@ -372,6 +506,49 @@ async def _resolve_session_vm(session_id: str) -> str:
 
     _session_map.set(session_id, new_vm_id)
     return new_vm_id
+
+
+async def reconcile_on_startup():
+    """Reconcile persisted VM records against actual Firecracker processes on boot.
+
+    A pod/process restart kills every child Firecracker PID but leaves overlays and
+    snapshots on the (node-local) disk, so records that still say "running" are stale.
+    This re-adopts genuinely live VMs, down-converts snapshot-bearing dead ones to
+    "paused" (so _resolve_session_vm auto-resumes them), errors the unrecoverable
+    rest, and rebuilds the slot free-list from the survivors. Flips _ready when done.
+    """
+    global _ready
+    in_use_slots: List[int] = []
+    for record in _vm_state.list_all():
+        vm_id = record["vm_id"]
+        pid = record.get("pid")
+        socket = Path(_socket_path(vm_id))
+        snap = record.get("snapshot")
+        slot = _record_slot(record)
+
+        if _pid_is_firecracker(pid) and socket.exists():
+            _vm_state.update(vm_id, {"status": "running"})
+            log.info(f"reconcile: re-adopted running VM {vm_id} (pid {pid}, slot {slot})")
+        elif snap and Path(snap.get("state_path", "")).exists() and Path(snap.get("mem_path", "")).exists():
+            _vm_state.update(vm_id, {"status": "paused", "pid": None})
+            if socket.exists():
+                socket.unlink()  # stale; resume relaunches a fresh FC process
+            log.info(f"reconcile: VM {vm_id} -> paused (resumable from snapshot)")
+        else:
+            _vm_state.update(vm_id, {
+                "status": "error", "pid": None,
+                "error": "no live process and no snapshot after restart",
+            })
+            log.warning(f"reconcile: VM {vm_id} -> error (unrecoverable after restart)")
+
+        # Keep the slot reserved for every surviving record (incl. error) so a new
+        # VM never collides with one still holding an overlay/tap; destroy releases it.
+        if slot is not None:
+            in_use_slots.append(slot)
+
+    _slots.rebuild_from_records(in_use_slots)
+    _ready = True
+    log.info(f"reconcile complete: {_slots.free_count()} free slots, node={NODE_NAME or '(standalone)'}")
 
 
 # ─── Pydantic Models ───────────────────────────────────────────────────────────
@@ -394,10 +571,26 @@ class BashExecInput(BaseModel):
     working_dir: Optional[str] = Field(default=None, description="Working directory inside the VM")
 
 
+class ExecInput(BaseModel):
+    """Router-internal exec request. The router supplies the stable session id;
+    this node resolves/creates/resumes that session's VM and runs the command."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., description="Stable Mcp-Session-Id from the router", min_length=1)
+    command: str = Field(..., min_length=1, max_length=8192)
+    timeout: int = Field(default=60, ge=1, le=600)
+    working_dir: Optional[str] = Field(default=None)
+
+
 # ─── FastMCP (bash_exec only) ──────────────────────────────────────────────────
 
 mcp = FastMCP(
     "firecracker_bash_mcp",
+    # LOAD-BEARING: stateful + SSE. The session->VM resolution and (in the HA
+    # topology) the router's session pinning both depend on the SDK assigning and
+    # echoing Mcp-Session-Id. Flipping either of these silently breaks session
+    # identity — treat a change here as a design fork, not a config tweak.
+    stateless_http=False,
+    json_response=False,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
     ),
@@ -462,14 +655,79 @@ async def bash_exec(params: BashExecInput, ctx: Context) -> str:
 
 # ─── FastAPI REST API + Docs ───────────────────────────────────────────────────
 
+async def publish_nodeagent_loop():
+    """Best-effort: publish this node-agent's identity + capacity as a NodeAgent CR.
+
+    The router reads NodeAgent.status.freeTaps (the single capacity authority) and
+    heartbeatTime (liveness). Skipped with a log line when not running in-cluster,
+    so standalone dev keeps working.
+    """
+    try:
+        from kubernetes_asyncio import client, config
+    except Exception:
+        log.info("kubernetes_asyncio unavailable; NodeAgent CR publishing disabled")
+        return
+    try:
+        config.load_incluster_config()
+    except Exception:
+        log.info("not in-cluster; NodeAgent CR publishing disabled")
+        return
+
+    group, version, plural = "fcmcp.io", "v1alpha1", "nodeagents"
+    namespace = os.environ.get("FC_MCP_NAMESPACE", "fc-mcp")
+    name = NODE_NAME or os.environ.get("POD_NAME") or "node-agent"
+    pod_ip = os.environ.get("POD_IP", "")
+    max_vms = int(os.environ.get("FC_MAX_VMS", str(SLOT_MAX - SLOT_MIN + 1)))
+    merge = "application/merge-patch+json"
+
+    co = client.CustomObjectsApi(client.ApiClient())
+    body = {
+        "apiVersion": f"{group}/{version}", "kind": "NodeAgent",
+        "metadata": {"name": name, "labels": {"fcmcp.io/node": name}},
+        "spec": {"nodeName": name, "podIP": pod_ip, "maxVms": max_vms},
+    }
+    try:
+        await co.create_namespaced_custom_object(group, version, namespace, plural, body)
+    except client.exceptions.ApiException as e:
+        if e.status != 409:  # already exists is fine
+            log.warning(f"could not create NodeAgent CR: {e}")
+
+    while True:
+        try:
+            running = sum(1 for v in _vm_state.list_all() if v.get("status") == "running")
+            phase = "Ready" if all(_readiness_checks().values()) else "NotReady"
+            status_body = {"status": {
+                "phase": phase,
+                "freeTaps": _slots.free_count(),
+                "runningVmCount": running,
+                "heartbeatTime": datetime.now(timezone.utc).isoformat(),
+            }}
+            try:
+                await co.patch_namespaced_custom_object_status(
+                    group, version, namespace, plural, name, status_body, _content_type=merge)
+            except TypeError:
+                await co.patch_namespaced_custom_object_status(
+                    group, version, namespace, plural, name, status_body)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"NodeAgent heartbeat failed: {e}")
+        await asyncio.sleep(10)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     for d in [BASE_DIR, VM_IMAGES_DIR, SNAPSHOTS_DIR, SOCKETS_DIR, BASE_DIR / "overlays"]:
         d.mkdir(parents=True, exist_ok=True)
     log.info(f"Firecracker server started. Base dir: {BASE_DIR}")
+    await reconcile_on_startup()
+    na_task = asyncio.create_task(publish_nodeagent_loop())
     # Run MCP session manager alongside FastAPI
     async with mcp._session_manager.run():
-        yield
+        try:
+            yield
+        finally:
+            na_task.cancel()
 
 
 # Build MCP ASGI handler (also initializes _session_manager)
@@ -520,23 +778,106 @@ class MCPRouter:
 
 # ─── REST Endpoints ────────────────────────────────────────────────────────────
 
+def _bridge_up() -> bool:
+    """Whether fc-br0 exists. On non-Linux (dev) there is no /sys/class/net; don't gate on it."""
+    sysnet = Path("/sys/class/net")
+    if not sysnet.exists():
+        return True
+    return (sysnet / "fc-br0").exists()
+
+
+@api.get("/health", tags=["Health"], summary="Liveness probe")
+async def api_health():
+    """Liveness: the process is up and serving. Always 200 while the event loop runs."""
+    return {"status": "ok", "node": NODE_NAME or None}
+
+
+def _readiness_checks() -> Dict[str, bool]:
+    return {
+        "reconciled": _ready,
+        "kernel_image": KERNEL_IMAGE.exists(),
+        "base_rootfs": BASE_ROOTFS.exists(),
+        "ssh_key": SSH_KEY_PATH.exists(),
+        "bridge_up": _bridge_up(),
+        "free_slots": _slots.free_count() > 0,
+    }
+
+
+@api.get("/ready", tags=["Health"], summary="Readiness probe")
+async def api_ready():
+    """Readiness: this node can successfully serve a new VM.
+
+    Returns 503 (so the scheduler/Service stops sending new work here) when reconcile
+    hasn't finished, images/key are missing, the bridge is down, or all slots are full —
+    while liveness stays green so existing pinned VMs keep running.
+    """
+    checks = _readiness_checks()
+    ok = all(checks.values())
+    return JSONResponse(
+        status_code=200 if ok else 503,
+        content={"ready": ok, "free_slots": _slots.free_count(), "checks": checks},
+    )
+
+
+@api.post("/drain", tags=["Health"], summary="Pause+snapshot every running VM (preStop hook)")
+async def api_drain():
+    """Snapshot all running VMs to the node-local PV so a pod restart/upgrade does not
+    kill in-VM state. Invoked by the StatefulSet preStop hook; reconcile + the router's
+    next exec then auto-resume each VM from its snapshot."""
+    results = []
+    for v in list(_vm_state.list_all()):
+        if v.get("status") == "running":
+            try:
+                await api_vm_pause(v["vm_id"])
+                results.append({"vm_id": v["vm_id"], "paused": True})
+            except Exception as e:
+                results.append({"vm_id": v["vm_id"], "paused": False, "error": str(e)})
+    return {"drained": results}
+
+
+@api.post("/exec", tags=["Exec"], summary="Run a command in the session's VM (router-internal)")
+async def api_exec(params: ExecInput):
+    """Resolve (create/resume) this session's VM on this node and run the command.
+
+    The router calls this over the internal network after pinning the session here;
+    the body mirrors what the MCP bash_exec tool used to do, keyed on the stable
+    session id instead of an in-process object id.
+    """
+    try:
+        vm_id = await _resolve_session_vm(params.session_id)
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"error": f"could not resolve VM: {e}"})
+
+    record = _vm_state.get(vm_id)
+    if not record or record["status"] != "running":
+        status = record["status"] if record else "missing"
+        return JSONResponse(status_code=409, content={"error": f"VM not running (status: {status})"})
+
+    command = params.command
+    if params.working_dir:
+        command = f"cd {params.working_dir} && {command}"
+
+    start = time.time()
+    result = await _ssh_exec(vm_id, command, timeout=params.timeout)
+    elapsed = round(time.time() - start, 2)
+    return {
+        "vm_id": vm_id, "command": params.command,
+        "stdout": result["stdout"], "stderr": result["stderr"],
+        "returncode": result["returncode"], "elapsed_seconds": elapsed,
+    }
+
+
 @api.post("/vms", status_code=201, tags=["VMs"], summary="Create a new microVM")
 async def api_vm_create(params: VMCreateInput):
     """Create and boot a new Firecracker microVM. Returns a `vm_id` to use with `bash_exec`."""
     vm_id = str(uuid.uuid4())
     name = params.name or f"vm-{vm_id[:8]}"
-    if any(v.get("name") == name for v in _vm_state.list_all()):
-        raise HTTPException(status_code=409, detail=f"VM named '{name}' already exists.")
-
-    idx = len(_vm_state.list_all()) + 2
-    ssh_port = VM_SSH_START_PORT + len(_vm_state.list_all())
-    record = {
-        "vm_id": vm_id, "name": name, "status": "creating",
-        "vcpu": params.vcpu, "mem_mb": params.mem_mb, "disk_mb": params.disk_mb,
-        "ip_address": f"172.16.0.{idx}",
-        "ssh_port": ssh_port, "created_at": time.time(), "pid": None, "snapshot": None,
-    }
-    _vm_state.create(vm_id, record)
+    try:
+        await _allocate_and_create_record(vm_id, name, params.vcpu, params.mem_mb, params.disk_mb)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     try:
         await _create_overlay(vm_id, params.disk_mb)
@@ -549,7 +890,7 @@ async def api_vm_create(params: VMCreateInput):
         _vm_state.update(vm_id, {"status": "running"})
         return {
             "vm_id": vm_id, "name": name, "status": "running",
-            "ssh_port": ssh_port, "ip_address": f"172.16.0.{_vm_index(vm_id)}",
+            "ip_address": _vm_ip(vm_id),
             "vcpu": params.vcpu, "mem_mb": params.mem_mb, "disk_mb": params.disk_mb,
         }
     except HTTPException:
@@ -567,7 +908,7 @@ async def api_vm_list():
             {
                 "vm_id": v["vm_id"], "name": v["name"], "status": v["status"],
                 "vcpu": v.get("vcpu"), "mem_mb": v.get("mem_mb"),
-                "ssh_port": v.get("ssh_port"),
+                "ip_address": v.get("ip_address"),
                 "has_snapshot": v.get("snapshot") is not None,
                 "created_at": v.get("created_at"),
             }
@@ -595,7 +936,7 @@ async def api_vm_status(vm_id: str):
     return {
         "vm_id": record["vm_id"], "name": record["name"], "status": record["status"],
         "vcpu": record.get("vcpu"), "mem_mb": record.get("mem_mb"),
-        "disk_mb": record.get("disk_mb"), "ssh_port": record.get("ssh_port"),
+        "disk_mb": record.get("disk_mb"), "ip_address": record.get("ip_address"),
         "pid": record.get("pid"), "created_at": record.get("created_at"),
         "snapshot": snap_info,
         "error": record.get("error"),
@@ -725,6 +1066,7 @@ async def api_vm_destroy(vm_id: str):
     if snap_dir.exists():
         shutil.rmtree(snap_dir)
 
+    _slots.release(_record_slot(record))
     _vm_state.delete(vm_id)
     _session_map.remove(vm_id)
     return {"vm_id": vm_id, "name": record["name"], "status": "destroyed"}

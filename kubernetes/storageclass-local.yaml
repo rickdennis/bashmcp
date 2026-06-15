@@ -1,0 +1,18 @@
+# Local-PV StorageClass for the node-agent's FC_BASE_DIR.
+#
+# A local PV gives the volume node-affinity, so a node-agent pod is PINNED to the
+# node holding its disk — a reschedule returns to the same overlays/snapshots/
+# vm-state.json. That is exactly the chosen "VMs pinned to node" HA posture.
+#
+# WaitForFirstConsumer co-locates the pod and its disk (don't bind until scheduled).
+#
+# Adjust `provisioner` to your cluster's local-storage provider. Defaults to the
+# common rancher.io/local-path (local-path-provisioner). For the static
+# local-volume provisioner use `kubernetes.io/no-provisioner` + pre-created PVs.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fc-local
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete

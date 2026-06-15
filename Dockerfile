@@ -36,8 +36,9 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
-COPY server.py start.sh ./
-RUN chmod +x start.sh
+COPY server.py start.sh setup-network.sh ./
+COPY proxy/ ./proxy/
+RUN chmod +x start.sh setup-network.sh
 
 ENV FC_BASE_DIR=/opt/fc-mcp
 ENV MCP_PORT=8080
@@ -45,4 +46,7 @@ ENV MCP_HOST=0.0.0.0
 
 EXPOSE 8080
 
+# One image, two roles:
+#   node-agent (default): ./start.sh -> server.py  (needs KVM + privileged)
+#   router:    override command -> ["uv","run","python","-m","proxy.router","--port","8080"]
 ENTRYPOINT ["./start.sh"]

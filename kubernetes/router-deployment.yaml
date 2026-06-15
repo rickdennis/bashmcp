@@ -1,0 +1,51 @@
+# Front-door MCP router. Plain web service (no KVM, no hostNetwork, not privileged).
+# 2 replicas; the Lease-elected leader is the only one that reports Ready, so the
+# Service routes to a single active replica and a standby takes over on failover.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fc-mcp-router
+  namespace: fc-mcp
+  labels:
+    app: fc-mcp-router
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fc-mcp-router
+  template:
+    metadata:
+      labels:
+        app: fc-mcp-router
+    spec:
+      serviceAccountName: fc-mcp-router
+      containers:
+        - name: router
+          image: fc-bash-mcp:latest
+          imagePullPolicy: IfNotPresent
+          command: ["uv", "run", "python", "-m", "proxy.router", "--port", "8080"]
+          ports:
+            - containerPort: 8080
+              name: mcp-http
+          env:
+            - name: POD_NAME            # leader-election identity
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FC_MCP_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: FC_MCP_NODE_PORT
+              value: "8080"
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:               # Ready ONLY on the leader (with synced cache)
+            httpGet: {path: /readyz, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {cpu: "1", memory: "512Mi"}

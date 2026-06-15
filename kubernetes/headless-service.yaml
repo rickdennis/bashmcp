@@ -1,0 +1,21 @@
+# Headless Service backing the node-agent StatefulSet.
+#
+# clusterIP: None gives each pod stable DNS (fc-node-0.fc-node.fc-mcp.svc...).
+# It is NOT used for load balancing — with hostNetwork the agent actually listens
+# on <nodeIP>:8080, and the router targets that nodeIP (from NodeAgent.spec.podIP).
+# The headless Service exists so the StatefulSet has a serviceName and stable identities.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fc-node
+  namespace: fc-mcp
+  labels:
+    app: fc-node-agent
+spec:
+  clusterIP: None
+  selector:
+    app: fc-node-agent
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
