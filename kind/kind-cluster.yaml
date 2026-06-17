@@ -1,0 +1,40 @@
+# kind cluster for the HA stack, on a Linux host that has /dev/kvm.
+# 1 control-plane + 3 workers. Each worker bind-mounts /dev/kvm and /dev/net/tun
+# so Firecracker can run inside the kind node container (which kind runs
+# privileged). The node-agent StatefulSet pins one pod per worker.
+#
+# cgroup driver = cgroupfs everywhere (kubelet + containerd). This host is
+# cgroup v1 with an old systemd; the default systemd driver makes the kind node
+# kubelets crash-loop creating their kubepods.slice. cgroupfs uses plain cgroup
+# directories with no systemd-slice dependency, which is deterministic here.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: fc-mcp
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+      SystemdCgroup = false
+kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    cgroupDriver: cgroupfs
+nodes:
+  - role: control-plane
+  - role: worker
+    extraMounts:
+      - hostPath: /dev/kvm
+        containerPath: /dev/kvm
+      - hostPath: /dev/net/tun
+        containerPath: /dev/net/tun
+  - role: worker
+    extraMounts:
+      - hostPath: /dev/kvm
+        containerPath: /dev/kvm
+      - hostPath: /dev/net/tun
+        containerPath: /dev/net/tun
+  - role: worker
+    extraMounts:
+      - hostPath: /dev/kvm
+        containerPath: /dev/kvm
+      - hostPath: /dev/net/tun
+        containerPath: /dev/net/tun

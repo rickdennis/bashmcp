@@ -166,6 +166,25 @@ Two topologies live in the repo:
 
 `claude mcp add --transport http firecracker-bash http://<router-or-gateway>/mcp` — point Claude Code at the **router** Service (or the gateway in front of it), not a node.
 
+## Local validation in kind (single KVM host)
+
+`kind/kind-up.sh` (run as root on a Linux+KVM host) stands up the whole HA stack in a
+3-worker kind cluster and boots real Firecracker VMs inside the kind nodes. Validated
+end-to-end on Amazon Linux 2. Hard-won gotchas baked into the scripts:
+
+- **cgroup driver must be `cgroupfs` everywhere.** AL2 is cgroup v1 with old systemd;
+  the default systemd driver makes kind node kubelets crash-loop creating `kubepods.slice`.
+  `kind-up.sh` pins Docker to `cgroupfs` and `kind/kind-cluster.yaml` patches the kubelet +
+  containerd to match.
+- **Raise inotify limits** before `kind create` or worker joins fail (`error uploading crisocket`).
+- **VM images + SSH key are seeded per node** to `/opt/fc-seed` (hostPath-mounted read-only into
+  pods) because each pod's local PV starts empty — the node-agent needs the kernel/rootfs and the
+  key that matches the rootfs's baked `authorized_keys`.
+- **`ssh -i <key>` reads `<key>.pub` to choose which key to offer** — a stale `.pub` in the data
+  dir makes it offer the wrong key. `start.sh` now always derives `.pub` from the private key.
+- `kind/mcp_smoke.py` drives `bash_exec` through the router end-to-end; `kind/fc-sshd-debug.sh`
+  captures a guest's `sshd -ddd` auth verdict when debugging in-VM SSH.
+
 ## Gotchas / Known Gaps
 
 - **Tests:** there's no framework, but `tests/test_phase0.py` is a dependency-free assert script (`uv run python tests/test_phase0.py`) covering slot stability + reconcile. Firecracker itself still needs Linux+KVM to exercise.

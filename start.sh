@@ -16,6 +16,11 @@ if [[ ! -f "$SSH_KEY" ]]; then
     ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "fc-mcp-vm-access"
     echo "✅ SSH key generated at $SSH_KEY"
 fi
+# Keep <key>.pub consistent with the (possibly mounted, read-only) private key.
+# `ssh -i <key>` reads <key>.pub to decide which key to OFFER; a stale .pub left
+# in the data dir makes it offer the wrong key and auth fails even with the right
+# private key. Always derive the .pub from the private key.
+ssh-keygen -y -f "$SSH_KEY" > "$SSH_KEY.pub" 2>/dev/null || true
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
 echo "==> Checking prerequisites..."

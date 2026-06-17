@@ -47,6 +47,7 @@ spec:
       initContainers:
         - name: network-setup
           image: fc-bash-mcp:latest
+          imagePullPolicy: IfNotPresent   # use the kind-loaded image; :latest would otherwise default to Always
           command: ["bash", "setup-network.sh"]
           securityContext:
             privileged: true
@@ -101,11 +102,24 @@ spec:
           volumeMounts:
             - name: fc-data
               mountPath: /opt/fc-mcp
+            # Shared read-only kernel+rootfs and the matching SSH key, seeded onto
+            # each node at /opt/fc-seed (the pod's PV is otherwise empty). In a real
+            # cluster these would be baked into the image / pulled from object store.
+            - name: vm-images
+              mountPath: /opt/fc-mcp/vm-images
+              readOnly: true
+            - name: vm-ssh-key
+              mountPath: /opt/fc-mcp/vm_ssh_key
+              readOnly: true
             - name: kvm
               mountPath: /dev/kvm
             - name: dev-net-tun
               mountPath: /dev/net/tun
       volumes:
+        - name: vm-images
+          hostPath: {path: /opt/fc-seed/vm-images, type: Directory}
+        - name: vm-ssh-key
+          hostPath: {path: /opt/fc-seed/vm_ssh_key, type: File}
         - name: kvm
           hostPath: {path: /dev/kvm, type: CharDevice}
         - name: dev-net-tun

@@ -25,7 +25,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 ARG FC_VERSION=v1.10.1
 RUN ARCH=$(uname -m) && \
     curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-${ARCH}.tgz" \
-    | tar -xz --strip-components=1 && \
+    | tar -xz && \
     mv "release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}" /usr/bin/firecracker && \
     mv "release-${FC_VERSION}-${ARCH}/jailer-${FC_VERSION}-${ARCH}" /usr/bin/jailer && \
     chmod +x /usr/bin/firecracker /usr/bin/jailer && \
