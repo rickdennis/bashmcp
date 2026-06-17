@@ -78,6 +78,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: FC_MAX_VMS
               value: "32"            # must match the tap count in setup-network.sh
+            - name: FC_IDLE_PAUSE_SECONDS
+              value: "300"           # snapshot+pause VMs idle >5min (frees RAM/CPU); next exec auto-resumes
           securityContext:
             privileged: true         # KVM + tap devices
           lifecycle:

@@ -57,6 +57,12 @@ SLOT_MAX = 33
 # Node identity (Kubernetes downward API spec.nodeName); empty when run standalone.
 NODE_NAME = os.environ.get("NODE_NAME", "")
 
+# Auto-pause a VM after this many idle seconds (snapshot + kill FC, freeing RAM and
+# the vCPU — resumed VMs busy-loop a core under Firecracker, so idle-pausing keeps
+# idle VMs cheap). The next bash_exec auto-resumes it. 0 disables.
+IDLE_PAUSE_SECONDS = int(os.environ.get("FC_IDLE_PAUSE_SECONDS", "300"))
+IDLE_CHECK_INTERVAL = int(os.environ.get("FC_IDLE_CHECK_INTERVAL", "30"))
+
 
 log = logging.getLogger("fc_mcp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -279,6 +285,11 @@ def _vm_tap(vm_id: str) -> str:
         slot = SLOT_MIN
     return f"fc-tap-{(slot - SLOT_MIN):08x}"
 
+def _touch(vm_id: str):
+    """Mark a VM as active so the idle-pause loop won't reap it mid-use."""
+    if _vm_state.get(vm_id):
+        _vm_state.update(vm_id, {"last_activity": time.time()})
+
 def _gen_mac(vm_id: str) -> str:
     h = vm_id.replace("-", "")[:10]
     return f"AA:FC:{h[0:2]}:{h[2:4]}:{h[4:6]}:{h[6:8]}"
@@ -436,7 +447,8 @@ async def _allocate_and_create_record(vm_id: str, name: str, vcpu: int, mem_mb: 
             "vm_id": vm_id, "name": name, "status": "creating",
             "vcpu": vcpu, "mem_mb": mem_mb, "disk_mb": disk_mb,
             "slot": slot, "ip_address": f"172.16.0.{slot}",
-            "created_at": time.time(), "pid": None, "snapshot": None,
+            "created_at": time.time(), "last_activity": time.time(),
+            "pid": None, "snapshot": None,
         }
         _vm_state.create(vm_id, record)
     return record
@@ -635,6 +647,7 @@ async def bash_exec(params: BashExecInput, ctx: Context) -> str:
                      f"Use POST /vms/{{vm_id}}/resume if paused."
         })
 
+    _touch(vm_id)  # mark active so idle-pause won't reap it mid-use
     command = params.command
     if params.working_dir:
         command = f"cd {params.working_dir} && {command}"
@@ -715,6 +728,37 @@ async def publish_nodeagent_loop():
         await asyncio.sleep(10)
 
 
+async def idle_pause_loop():
+    """Pause VMs idle longer than IDLE_PAUSE_SECONDS (snapshot + free RAM/CPU).
+
+    The next bash_exec auto-resumes them via _resolve_session_vm. Reuses the REST
+    pause path. Disabled when IDLE_PAUSE_SECONDS <= 0.
+    """
+    if IDLE_PAUSE_SECONDS <= 0:
+        log.info("idle-pause disabled (FC_IDLE_PAUSE_SECONDS<=0)")
+        return
+    log.info(f"idle-pause enabled: pause after {IDLE_PAUSE_SECONDS}s idle (check every {IDLE_CHECK_INTERVAL}s)")
+    while True:
+        try:
+            await asyncio.sleep(IDLE_CHECK_INTERVAL)
+            now = time.time()
+            for v in list(_vm_state.list_all()):
+                if v.get("status") != "running":
+                    continue
+                idle = now - (v.get("last_activity") or v.get("created_at") or now)
+                if idle >= IDLE_PAUSE_SECONDS:
+                    vm_id = v["vm_id"]
+                    log.info(f"idle-pause: pausing {vm_id} (idle {int(idle)}s)")
+                    try:
+                        await api_vm_pause(vm_id)
+                    except Exception as e:
+                        log.warning(f"idle-pause failed for {vm_id}: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"idle-pause loop error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     for d in [BASE_DIR, VM_IMAGES_DIR, SNAPSHOTS_DIR, SOCKETS_DIR, BASE_DIR / "overlays"]:
@@ -722,12 +766,14 @@ async def lifespan(app: FastAPI):
     log.info(f"Firecracker server started. Base dir: {BASE_DIR}")
     await reconcile_on_startup()
     na_task = asyncio.create_task(publish_nodeagent_loop())
+    idle_task = asyncio.create_task(idle_pause_loop())
     # Run MCP session manager alongside FastAPI
     async with mcp._session_manager.run():
         try:
             yield
         finally:
             na_task.cancel()
+            idle_task.cancel()
 
 
 # Build MCP ASGI handler (also initializes _session_manager)
@@ -853,6 +899,7 @@ async def api_exec(params: ExecInput):
         status = record["status"] if record else "missing"
         return JSONResponse(status_code=409, content={"error": f"VM not running (status: {status})"})
 
+    _touch(vm_id)  # mark active so idle-pause won't reap it mid-use
     command = params.command
     if params.working_dir:
         command = f"cd {params.working_dir} && {command}"
