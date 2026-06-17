@@ -122,7 +122,9 @@ The server connects straight to the VM's bridge IP on port 22 (the old unused `s
 
 **Startup reconcile:** `reconcile_on_startup()` runs before serving — a process/pod restart kills child FC PIDs but leaves overlays/snapshots on the (node-local) disk. It re-adopts genuinely live VMs (`os.kill` + `/proc/<pid>/comm`), down-converts dead-but-snapshotted VMs to `paused` (so the next call auto-resumes), errors the rest, and rebuilds the slot free-list from survivors. `/ready` stays 503 until it completes.
 
-**Pause/resume:** Uses Firecracker's native snapshot API — PATCH `/vm` to freeze, PUT `/snapshot/create` to dump memory+vmstate to disk, then SIGKILL the FC process. Resume launches a fresh FC process (after unlinking the stale sockets) and calls PUT `/snapshot/load`. There is exactly one snapshot per VM, overwritten on each pause.
+**Pause/resume:** Uses Firecracker's native snapshot API — PATCH `/vm` to freeze, PUT `/snapshot/create` to dump memory+vmstate to disk, then SIGKILL the FC process. Resume launches a fresh FC process (after unlinking the stale sockets) and calls PUT `/snapshot/load`. There is exactly one snapshot per VM, overwritten on each pause. `_pause_vm(vm_id, archive)` is the shared core (the REST pause endpoint and `idle_pause_loop` archive=True; `api_drain`/preStop archive=False).
+
+**S3 snapshot archival (optional, `FC_S3_BUCKET`):** to make paused VMs survive *node* loss (local PV is node-local), every archive=True pause uploads `overlay.ext4`+`memory.bin`+`vmstate.bin`+`meta.json` to `s3://<bucket>/<FC_S3_PREFIX>/<vm_id>/` (`_s3_archive_vm`, boto3 via `asyncio.to_thread`). Resume and `POST /restore` pull them back when the local files are gone (`_s3_restore_vm`), reconstruct the record from `meta.json`, and **reserve the same slot** so the snapshot's tap/IP/MAC match. Disabled when `FC_S3_BUCKET` is unset; creds via the boto3 default chain (EC2 instance role through IMDS, or IRSA on EKS — `s3:Get/Put/Delete/ListBucket`). Running (un-paused) VMs are still lost on node death — accepted. Router-driven auto-failover (re-place `Lost` sessions → `/restore`) is a deferred Phase B.
 
 **Command execution:** All `bash_exec` calls SSH as root directly to the VM's bridge IP (`172.16.0.X:22`) using `vm_ssh_key`, with host-key checking disabled. The `working_dir` param prepends `cd <dir> &&` to the command string.
 
@@ -146,6 +148,7 @@ Interactive docs at `http://<host>:8080/docs`
 | `GET` | `/ready` | Readiness — 503 until reconcile done / images+key present / bridge up / a free slot exists |
 | `POST` | `/exec` | **Router-internal.** `{session_id, command, working_dir, timeout}` → resolve/create/resume the session's VM and run it |
 | `POST` | `/drain` | **preStop hook.** Pause+snapshot every running VM so a restart/upgrade preserves in-VM state |
+| `POST` | `/restore` | **Router-internal.** `{vm_id, session_id?}` → pull a VM's snapshot from S3, resume it, bind the session (recover after node loss; needs `FC_S3_BUCKET`) |
 | `POST` | `/vms` | Create VM — allocates a slot, copies base rootfs → overlay, launches FC, waits for SSH (45s) |
 | `GET` | `/vms` | List all VMs from in-memory state |
 | `GET` | `/vms/{vm_id}` | VM status + current snapshot info (single snapshot, not a history) |

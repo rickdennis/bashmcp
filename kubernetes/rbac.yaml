@@ -3,6 +3,11 @@
 
 ---
 # Node-agent: publishes its own NodeAgent CR (identity + capacity + heartbeat).
+# For S3 snapshot archival on EKS, attach an IRSA role granting s3:Get/Put/Delete/ListBucket
+# on the snapshot bucket/prefix by adding:
+#   annotations:
+#     eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/<fc-mcp-s3-role>
+# On a plain EC2/kind host (hostNetwork) boto3 uses the node's instance role via IMDS instead.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

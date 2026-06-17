@@ -63,6 +63,14 @@ NODE_NAME = os.environ.get("NODE_NAME", "")
 IDLE_PAUSE_SECONDS = int(os.environ.get("FC_IDLE_PAUSE_SECONDS", "300"))
 IDLE_CHECK_INTERVAL = int(os.environ.get("FC_IDLE_CHECK_INTERVAL", "30"))
 
+# Optional S3 archival of paused-VM snapshots, so a paused VM survives node loss and
+# can be restored on a survivor node. Disabled when FC_S3_BUCKET is unset. Credentials
+# come from the boto3 default chain (EC2 instance role via IMDS on the host; IRSA/Secret
+# on EKS). Objects: s3://<bucket>/<prefix>/<vm_id>/{overlay.ext4,memory.bin,vmstate.bin,meta.json}
+FC_S3_BUCKET = os.environ.get("FC_S3_BUCKET", "")
+FC_S3_PREFIX = os.environ.get("FC_S3_PREFIX", "fc-mcp/snapshots").strip("/")
+S3_ENABLED = bool(FC_S3_BUCKET)
+
 
 log = logging.getLogger("fc_mcp")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -322,6 +330,100 @@ def _pid_is_firecracker(pid: Optional[int]) -> bool:
     return True
 
 
+# ─── S3 snapshot archival (optional; FC_S3_BUCKET) ──────────────────────────────
+
+def _s3_key(vm_id: str, name: str) -> str:
+    return f"{FC_S3_PREFIX}/{vm_id}/{name}"
+
+def _archive_blocking(vm_id: str, record: Dict):
+    """Upload overlay + memory + vmstate + meta.json to S3. Blocking — call via to_thread."""
+    import boto3
+    s3 = boto3.client("s3")
+    snap = record.get("snapshot") or {}
+    overlay = _overlay_path(vm_id)
+    mem = Path(snap.get("mem_path", ""))
+    state = Path(snap.get("state_path", ""))
+    if overlay.exists():
+        s3.upload_file(str(overlay), FC_S3_BUCKET, _s3_key(vm_id, "overlay.ext4"))
+    if mem.exists():
+        s3.upload_file(str(mem), FC_S3_BUCKET, _s3_key(vm_id, "memory.bin"))
+    if state.exists():
+        s3.upload_file(str(state), FC_S3_BUCKET, _s3_key(vm_id, "vmstate.bin"))
+    meta = {
+        "vm_id": vm_id, "name": record.get("name"), "slot": _record_slot(record),
+        "ip_address": record.get("ip_address"), "vcpu": record.get("vcpu"),
+        "mem_mb": record.get("mem_mb"), "disk_mb": record.get("disk_mb"),
+        "created_at": record.get("created_at"),
+    }
+    s3.put_object(Bucket=FC_S3_BUCKET, Key=_s3_key(vm_id, "meta.json"),
+                  Body=json.dumps(meta).encode())
+
+def _restore_blocking(vm_id: str) -> Optional[Dict]:
+    """Download meta.json + artifacts from S3 to local paths. Blocking. Returns meta or None."""
+    import boto3
+    from botocore.exceptions import ClientError
+    s3 = boto3.client("s3")
+    try:
+        obj = s3.get_object(Bucket=FC_S3_BUCKET, Key=_s3_key(vm_id, "meta.json"))
+        meta = json.loads(obj["Body"].read())
+    except ClientError:
+        return None
+    overlay = _overlay_path(vm_id); overlay.parent.mkdir(parents=True, exist_ok=True)
+    snap_dir = _snapshot_dir(vm_id); snap_dir.mkdir(parents=True, exist_ok=True)
+    s3.download_file(FC_S3_BUCKET, _s3_key(vm_id, "overlay.ext4"), str(overlay))
+    s3.download_file(FC_S3_BUCKET, _s3_key(vm_id, "memory.bin"), str(snap_dir / "memory.bin"))
+    s3.download_file(FC_S3_BUCKET, _s3_key(vm_id, "vmstate.bin"), str(snap_dir / "vmstate.bin"))
+    return meta
+
+async def _s3_archive_vm(vm_id: str):
+    """Best-effort: archive a paused VM's artifacts to S3 (no-op when disabled)."""
+    if not S3_ENABLED:
+        return
+    record = _vm_state.get(vm_id)
+    if not record:
+        return
+    try:
+        await asyncio.to_thread(_archive_blocking, vm_id, record)
+        _vm_state.update(vm_id, {"archived_at": time.time()})
+        log.info(f"s3-archive: {vm_id} -> s3://{FC_S3_BUCKET}/{_s3_key(vm_id, '')}")
+    except Exception as e:
+        log.warning(f"s3-archive failed for {vm_id}: {e}")
+
+async def _s3_restore_vm(vm_id: str) -> bool:
+    """Download a VM's artifacts from S3 to local paths, rebuild its record, reserve its slot.
+
+    Returns True if restored (artifacts now local + record present as 'paused'). The same slot
+    must be free on this node so the snapshot's tap/IP/MAC match.
+    """
+    if not S3_ENABLED:
+        return False
+    try:
+        meta = await asyncio.to_thread(_restore_blocking, vm_id)
+    except Exception as e:
+        log.warning(f"s3-restore failed for {vm_id}: {e}")
+        return False
+    if not meta:
+        return False
+    snap_dir = _snapshot_dir(vm_id)
+    slot = meta.get("slot")
+    record = dict(_vm_state.get(vm_id) or {})
+    record.update({
+        "vm_id": vm_id, "name": meta.get("name") or f"vm-{vm_id[:8]}", "status": "paused",
+        "vcpu": meta.get("vcpu", DEFAULT_VCPU), "mem_mb": meta.get("mem_mb", DEFAULT_MEM_MB),
+        "disk_mb": meta.get("disk_mb", DEFAULT_DISK_MB), "slot": slot,
+        "ip_address": meta.get("ip_address") or (f"172.16.0.{slot}" if slot is not None else None),
+        "snapshot": {"created_at": meta.get("created_at"),
+                     "mem_path": str(snap_dir / "memory.bin"),
+                     "state_path": str(snap_dir / "vmstate.bin")},
+        "pid": None, "last_activity": time.time(),
+    })
+    if slot is not None:
+        _slots.reserve(slot)
+    _vm_state.create(vm_id, record)
+    log.info(f"s3-restore: {vm_id} pulled from S3 (slot {slot})")
+    return True
+
+
 async def _create_overlay(vm_id: str, size_mb: int):
     overlay = _overlay_path(vm_id)
     overlay.parent.mkdir(parents=True, exist_ok=True)
@@ -467,6 +569,13 @@ async def _resolve_session_vm(session_id: str) -> str:
             if record["status"] == "paused":
                 log.info(f"Auto-resuming VM {vm_id} for session {session_id}")
                 snap = record.get("snapshot")
+                # If the local snapshot/overlay are gone (e.g. recovered onto a node
+                # that lost its PV), pull them back from S3 before resuming.
+                if (not snap or not Path(snap.get("state_path", "")).exists()
+                        or not _overlay_path(vm_id).exists()):
+                    if await _s3_restore_vm(vm_id):
+                        record = _vm_state.get(vm_id)
+                        snap = record.get("snapshot")
                 if not snap:
                     raise RuntimeError(f"VM {vm_id} is paused but has no snapshot.")
                 socket = _socket_path(vm_id)
@@ -591,6 +700,13 @@ class ExecInput(BaseModel):
     command: str = Field(..., min_length=1, max_length=8192)
     timeout: int = Field(default=60, ge=1, le=600)
     working_dir: Optional[str] = Field(default=None)
+
+
+class RestoreInput(BaseModel):
+    """Router-internal: restore a VM from S3 onto this node and bind a session to it."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    vm_id: str = Field(..., min_length=1)
+    session_id: Optional[str] = Field(default=None, description="Bind this session to the restored VM")
 
 
 # ─── FastMCP (bash_exec only) ──────────────────────────────────────────────────
@@ -750,7 +866,7 @@ async def idle_pause_loop():
                     vm_id = v["vm_id"]
                     log.info(f"idle-pause: pausing {vm_id} (idle {int(idle)}s)")
                     try:
-                        await api_vm_pause(vm_id)
+                        await _pause_vm(vm_id, archive=True)
                     except Exception as e:
                         log.warning(f"idle-pause failed for {vm_id}: {e}")
         except asyncio.CancelledError:
@@ -874,7 +990,9 @@ async def api_drain():
     for v in list(_vm_state.list_all()):
         if v.get("status") == "running":
             try:
-                await api_vm_pause(v["vm_id"])
+                # archive=False: preStop = same-node pod restart; the local PV persists,
+                # so S3 isn't needed and uploading every VM within the grace window is risky.
+                await _pause_vm(v["vm_id"], archive=False)
                 results.append({"vm_id": v["vm_id"], "paused": True})
             except Exception as e:
                 results.append({"vm_id": v["vm_id"], "paused": False, "error": str(e)})
@@ -912,6 +1030,22 @@ async def api_exec(params: ExecInput):
         "stdout": result["stdout"], "stderr": result["stderr"],
         "returncode": result["returncode"], "elapsed_seconds": elapsed,
     }
+
+
+@api.post("/restore", tags=["Exec"], summary="Restore a VM from S3 + bind a session (router-internal)")
+async def api_restore(params: RestoreInput):
+    """Recover a paused VM that was archived to S3 (e.g. after node loss): downloads its
+    artifacts onto this node, reserves its slot, resumes it, and binds the session so the
+    next /exec reaches it. api_vm_resume does the S3 pull-on-missing."""
+    if not S3_ENABLED:
+        return JSONResponse(status_code=503, content={"error": "S3 archival disabled (FC_S3_BUCKET unset)"})
+    try:
+        result = await api_vm_resume(params.vm_id)
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"error": e.detail})
+    if params.session_id:
+        _session_map.set(params.session_id, params.vm_id)
+    return {"vm_id": params.vm_id, "session_id": params.session_id, "status": "running", "resume": result}
 
 
 @api.post("/vms", status_code=201, tags=["VMs"], summary="Create a new microVM")
@@ -990,13 +1124,15 @@ async def api_vm_status(vm_id: str):
     }
 
 
-@api.post("/vms/{vm_id}/pause", tags=["VMs"], summary="Pause VM and save snapshot")
-async def api_vm_pause(vm_id: str):
+async def _pause_vm(vm_id: str, archive: bool = True) -> Dict:
+    """Snapshot + pause a VM (kill its FC process). If archive and S3 is enabled, also
+    upload the snapshot to S3 so it survives node loss. Raises KeyError (not found) or
+    RuntimeError (not running / pause failed)."""
     record = _vm_state.get(vm_id)
     if not record:
-        raise HTTPException(status_code=404, detail=f"VM '{vm_id}' not found.")
+        raise KeyError(f"VM '{vm_id}' not found.")
     if record["status"] != "running":
-        raise HTTPException(status_code=409, detail=f"VM must be running to pause (status: {record['status']}).")
+        raise RuntimeError(f"VM must be running to pause (status: {record['status']}).")
 
     snap_dir = _snapshot_dir(vm_id)
     snap_dir.mkdir(parents=True, exist_ok=True)
@@ -1007,11 +1143,9 @@ async def api_vm_pause(vm_id: str):
         fc = FirecrackerClient(_socket_path(vm_id))
         await fc.patch("/vm", {"state": "Paused"})
         await fc.put("/snapshot/create", {
-            "snapshot_type": "Full", "snapshot_path": state_path,
-            "mem_file_path": mem_path,
+            "snapshot_type": "Full", "snapshot_path": state_path, "mem_file_path": mem_path,
         })
         await fc.close()
-
         pid = record.get("pid")
         if pid:
             try:
@@ -1020,28 +1154,37 @@ async def api_vm_pause(vm_id: str):
                 os.kill(pid, 9)
             except ProcessLookupError:
                 pass
-
-        snapshot_entry = {
-            "created_at": time.time(),
-            "mem_path": mem_path, "state_path": state_path,
-        }
         _vm_state.update(vm_id, {
             "status": "paused", "pid": None,
-            "snapshot": snapshot_entry,
+            "snapshot": {"created_at": time.time(), "mem_path": mem_path, "state_path": state_path},
         })
-
-        mem_size_mb = round(Path(mem_path).stat().st_size / 1024 / 1024, 1) if Path(mem_path).exists() else 0
-        return {
-            "vm_id": vm_id, "status": "paused",
-            "mem_snapshot_mb": mem_size_mb,
-        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to pause VM: {e}")
+        raise RuntimeError(f"Failed to pause VM: {e}")
+
+    if archive:
+        await _s3_archive_vm(vm_id)
+    mem_size_mb = round(Path(mem_path).stat().st_size / 1024 / 1024, 1) if Path(mem_path).exists() else 0
+    return {"vm_id": vm_id, "status": "paused", "mem_snapshot_mb": mem_size_mb}
+
+
+@api.post("/vms/{vm_id}/pause", tags=["VMs"], summary="Pause VM and save snapshot")
+async def api_vm_pause(vm_id: str):
+    try:
+        return await _pause_vm(vm_id, archive=True)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409 if "must be running" in str(e) else 500, detail=str(e))
 
 
 @api.post("/vms/{vm_id}/resume", tags=["VMs"], summary="Resume VM from snapshot")
 async def api_vm_resume(vm_id: str):
     record = _vm_state.get(vm_id)
+    # Unknown locally or files gone (e.g. recovered onto a node that lost its PV):
+    # pull the snapshot back from S3, which rebuilds the record as 'paused'.
+    if not record or record.get("status") != "paused" or not Path((record.get("snapshot") or {}).get("state_path", "")).exists():
+        if await _s3_restore_vm(vm_id):
+            record = _vm_state.get(vm_id)
     if not record:
         raise HTTPException(status_code=404, detail=f"VM '{vm_id}' not found.")
     if record["status"] != "paused":
