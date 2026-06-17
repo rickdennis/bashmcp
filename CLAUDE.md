@@ -187,6 +187,15 @@ end-to-end on Amazon Linux 2. Hard-won gotchas baked into the scripts:
 
 ## Gotchas / Known Gaps
 
+- **Snapshot-resumed VMs busy-loop a vCPU (~100% host CPU).** A VM resumed via
+  `snapshot/load` spins its vCPU even when the guest is fully idle (guest reports
+  100% idle, tickless, `tsc`, default `hlt` idle, no `idle=poll`) — a Firecracker
+  resume behavior (likely a restored LAPIC tsc-deadline timer firing repeatedly),
+  not our code. Freshly-booted VMs idle correctly at 0%. **Pausing the VM kills its
+  FC process → 0 CPU**, so the idle-pause path is the mitigation; the Phase-2
+  idle-session GC (pause after N seconds idle) makes it a non-issue in steady
+  state. A proper fix likely means a newer Firecracker release — worth testing.
+
 - **Tests:** there's no framework, but `tests/test_phase0.py` is a dependency-free assert script (`uv run python tests/test_phase0.py`) covering slot stability + reconcile. Firecracker itself still needs Linux+KVM to exercise.
 - **MCP transport mode is load-bearing:** both `server.py` and `proxy/router.py` pin `FastMCP(stateless_http=False, json_response=False)`. The SDK keeps stateful sessions in an **in-process dict** and 404s any `Mcp-Session-Id` the live process didn't initialize — which is *why* the router (not the node) terminates MCP, so a node-agent restart doesn't 404 sessions. Treat a change to these flags as a design fork.
 - **VMs are pets, pinned to a node.** No cross-node migration; a node death loses its VMs by design (survivors/new sessions are unaffected). On a node-agent pod restart, the router stays up and the next `bash_exec` auto-resumes from the preStop snapshot on the local PV.
