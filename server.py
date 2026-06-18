@@ -423,6 +423,22 @@ async def _s3_restore_vm(vm_id: str) -> bool:
     log.info(f"s3-restore: {vm_id} pulled from S3 (slot {slot})")
     return True
 
+def _delete_blocking(vm_id: str):
+    import boto3
+    s3 = boto3.client("s3")
+    for name in ("overlay.ext4", "memory.bin", "vmstate.bin", "meta.json"):
+        s3.delete_object(Bucket=FC_S3_BUCKET, Key=_s3_key(vm_id, name))
+
+async def _s3_delete_vm(vm_id: str):
+    """Best-effort: remove a VM's S3 archive (called on destroy so it isn't orphaned)."""
+    if not S3_ENABLED:
+        return
+    try:
+        await asyncio.to_thread(_delete_blocking, vm_id)
+        log.info(f"s3-delete: removed archive for {vm_id}")
+    except Exception as e:
+        log.warning(f"s3-delete failed for {vm_id}: {e}")
+
 
 async def _create_overlay(vm_id: str, size_mb: int):
     overlay = _overlay_path(vm_id)
@@ -1259,6 +1275,7 @@ async def api_vm_destroy(vm_id: str):
     _slots.release(_record_slot(record))
     _vm_state.delete(vm_id)
     _session_map.remove(vm_id)
+    await _s3_delete_vm(vm_id)  # no-op when S3 disabled; removes the archive otherwise
     return {"vm_id": vm_id, "name": record["name"], "status": "destroyed"}
 
 
