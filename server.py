@@ -1552,6 +1552,38 @@ ENVIRONMENTS = _JsonStore(BASE_DIR / "environments.json")
 AGENT_SESSIONS = _JsonStore(BASE_DIR / "agent-sessions.json")
 DEFAULT_AGENT_MODEL = os.environ.get("FC_AGENT_MODEL", "claude-sonnet-4-6")
 
+# Map managed-agents-style toolset names (agent_toolset_20260401: bash/edit/read/…) onto the
+# Claude Agent SDK's tool names. Done host-side (here) so the runner always receives SDK names
+# and needs no rebuild when the mapping changes. Already-correct SDK names pass through.
+# NOTE (deferred): custom tools (agent.custom_tool_use → idle → user.custom_tool_result) are a
+# separate round-trip that needs runner support; not implemented here.
+_TOOL_NAME_MAP = {
+    "bash": "Bash", "edit": "Edit", "read": "Read", "write": "Write",
+    "glob": "Glob", "grep": "Grep", "web_fetch": "WebFetch", "web_search": "WebSearch",
+}
+
+
+def _normalize_tools(tools: Optional[List[str]]) -> Optional[List[str]]:
+    """Normalize a tool list to SDK names. Accepts managed-agents names (bash, web_fetch, …)
+    or SDK names (Bash, WebFetch, …); unknown names pass through unchanged (e.g. mcp__… )."""
+    if not tools:
+        return tools
+    return [_TOOL_NAME_MAP.get(t, _TOOL_NAME_MAP.get(t.lower(), t)) for t in tools]
+
+
+def _agent_snapshot(agent: Dict, version: Optional[int] = None) -> Dict:
+    """Resolve a frozen, immutable config snapshot for an agent version (default: latest).
+    Versions are stored in agent['versions'] keyed by stringified version number."""
+    versions = agent.get("versions") or {}
+    if version is None:
+        version = agent.get("version", 1)
+    snap = versions.get(str(version))
+    if snap is None:  # legacy agent (pre-versioning) — synthesize from top-level fields
+        snap = {"version": agent.get("version", 1), "name": agent.get("name"),
+                "model": agent.get("model"), "system": agent.get("system"),
+                "allowed_tools": agent.get("allowed_tools")}
+    return snap
+
 
 async def _agent_exec_async_start(vm_id: str, command: str, timeout: int = 86400) -> str:
     """Start a long-running command via fc-agent /exec_async and return its exec_id WITHOUT
@@ -1606,10 +1638,16 @@ async def _create_and_boot_vm(name: str, vcpu: int, mem_mb: int, disk_mb: int) -
 
 
 async def _create_agent_session(agent_id: str, title: Optional[str] = None,
-                                environment_id: Optional[str] = None) -> Dict:
+                                environment_id: Optional[str] = None,
+                                agent_version: Optional[int] = None) -> Dict:
     agent = AGENTS.get(agent_id)
     if not agent:
         raise KeyError(f"agent '{agent_id}' not found")
+    if agent.get("archived_at"):
+        raise ValueError(f"agent '{agent_id}' is archived")
+    snap = _agent_snapshot(agent, agent_version)
+    if agent_version is not None and not (agent.get("versions") or {}).get(str(agent_version)):
+        raise KeyError(f"agent '{agent_id}' has no version {agent_version}")
     env = None
     if environment_id:
         env = ENVIRONMENTS.get(environment_id)
@@ -1623,16 +1661,19 @@ async def _create_agent_session(agent_id: str, title: Optional[str] = None,
         (env or {}).get("disk_mb", DEFAULT_DISK_MB),
     )
     _session_map.set(sid, vm_id)  # bind so later turns auto-resume the same VM
-    cfg: Dict[str, Any] = {"model": agent.get("model") or DEFAULT_AGENT_MODEL}
-    if agent.get("system"):
-        cfg["system"] = agent["system"]
-    if agent.get("allowed_tools"):
-        cfg["allowedTools"] = agent["allowed_tools"]
+    cfg: Dict[str, Any] = {"model": snap.get("model") or DEFAULT_AGENT_MODEL}
+    if snap.get("system"):
+        cfg["system"] = snap["system"]
+    tools = _normalize_tools(snap.get("allowed_tools"))
+    if tools:
+        cfg["allowedTools"] = tools
     await _agent_b64write(vm_id, "/etc/fc-agent-runner/agent.json", json.dumps(cfg))
     exec_id = await _agent_exec_async_start(vm_id, f"fc-agent-runner --session {sid}")
-    rec = {"id": sid, "type": "session", "agent_id": agent_id, "agent_snapshot": agent,
+    rec = {"id": sid, "type": "session", "agent_id": agent_id,
+           "agent_version": snap.get("version"), "agent_snapshot": snap,
            "environment_id": environment_id, "vm_id": vm_id, "status": "idle",
            "runner_exec_id": exec_id, "title": title,
+           "usage": {"input_tokens": 0, "output_tokens": 0, "total_cost_usd": 0.0, "turns": 0},
            "created_at": time.time(), "updated_at": time.time()}
     AGENT_SESSIONS.put(sid, rec)
     return rec
@@ -1692,9 +1733,18 @@ class AgentCreateInput(BaseModel):
     allowed_tools: Optional[List[str]] = None
 
 
+class AgentUpdateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    model: Optional[str] = None
+    system: Optional[str] = Field(default=None, max_length=20000)
+    allowed_tools: Optional[List[str]] = None
+
+
 class SessionCreateInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_id: str = Field(..., min_length=1)
+    agent_version: Optional[int] = Field(default=None, ge=1)
     environment_id: Optional[str] = None
     title: Optional[str] = Field(default=None, max_length=200)
 
@@ -1727,10 +1777,14 @@ class AgentRunInput(BaseModel):
 @api.post("/v1/agents", status_code=201, tags=["Agents"], summary="Create an agent definition")
 async def api_agent_create(params: AgentCreateInput):
     aid = "agent_" + secrets.token_hex(12)
+    now = time.time()
+    model = params.model or DEFAULT_AGENT_MODEL
+    snap = {"version": 1, "name": params.name, "model": model,
+            "system": params.system, "allowed_tools": params.allowed_tools, "created_at": now}
     rec = {"id": aid, "type": "agent", "version": 1, "name": params.name,
-           "model": params.model or DEFAULT_AGENT_MODEL, "system": params.system,
-           "allowed_tools": params.allowed_tools,
-           "created_at": time.time(), "updated_at": time.time()}
+           "model": model, "system": params.system, "allowed_tools": params.allowed_tools,
+           "versions": {"1": snap}, "archived_at": None,
+           "created_at": now, "updated_at": now}
     AGENTS.put(aid, rec)
     return rec
 
@@ -1748,12 +1802,63 @@ async def api_agent_get(agent_id: str):
     return a
 
 
+@api.post("/v1/agents/{agent_id}", tags=["Agents"], summary="Update an agent (creates a new version)")
+async def api_agent_update(agent_id: str, params: AgentUpdateInput):
+    rec = AGENTS.get(agent_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
+    if rec.get("archived_at"):
+        raise HTTPException(status_code=409, detail=f"agent '{agent_id}' is archived")
+    # A None field means "unchanged" (managed-agents convention) — top-level fields carry over.
+    if params.name is not None:
+        rec["name"] = params.name
+    if params.model is not None:
+        rec["model"] = params.model
+    if params.system is not None:
+        rec["system"] = params.system
+    if params.allowed_tools is not None:
+        rec["allowed_tools"] = params.allowed_tools
+    new_version = int(rec.get("version", 1)) + 1
+    now = time.time()
+    rec["version"] = new_version
+    rec["updated_at"] = now
+    rec.setdefault("versions", {})[str(new_version)] = {
+        "version": new_version, "name": rec["name"], "model": rec["model"],
+        "system": rec["system"], "allowed_tools": rec["allowed_tools"], "created_at": now}
+    AGENTS.put(agent_id, rec)
+    return rec
+
+
+@api.get("/v1/agents/{agent_id}/versions", tags=["Agents"], summary="List an agent's versions")
+async def api_agent_versions(agent_id: str):
+    rec = AGENTS.get(agent_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
+    versions = rec.get("versions") or {}
+    data = [versions[k] for k in sorted(versions, key=lambda x: int(x))]
+    return {"data": data}
+
+
+@api.post("/v1/agents/{agent_id}/archive", tags=["Agents"], summary="Archive an agent")
+async def api_agent_archive(agent_id: str):
+    rec = AGENTS.get(agent_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
+    rec["archived_at"] = time.time()
+    rec["updated_at"] = time.time()
+    AGENTS.put(agent_id, rec)
+    return rec
+
+
 @api.post("/v1/sessions", status_code=201, tags=["Agent sessions"], summary="Create an agent session (boots a VM running the agent)")
 async def api_session_create(params: SessionCreateInput):
     try:
-        return await _create_agent_session(params.agent_id, params.title, params.environment_id)
+        return await _create_agent_session(params.agent_id, params.title,
+                                           params.environment_id, params.agent_version)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"session create failed: {e}")
 
@@ -1894,7 +1999,7 @@ async def agent_run(params: AgentRunInput, ctx: Context) -> str:
     prompt, and return the agent's final result. JSON: {session_id, vm_id, result, events}."""
     try:
         rec = await _create_agent_session(params.agent_id, title="agent_run")
-    except KeyError as e:
+    except (KeyError, ValueError) as e:
         return json.dumps({"error": str(e)})
     sid = rec["id"]
     await _session_send(sid, params.prompt)
