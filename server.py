@@ -68,6 +68,11 @@ IDLE_CHECK_INTERVAL = int(os.environ.get("FC_IDLE_CHECK_INTERVAL", "30"))
 # Guest agent (fc-agent) control-plane HTTP port — replaces SSH for command exec.
 AGENT_HTTP_PORT = int(os.environ.get("FC_AGENT_HTTP_PORT", "2025"))
 
+# Host source for the in-VM agent runner's Anthropic creds, injected into the overlay at
+# /etc/fc-agent-runner/anthropic.env before boot. Precedence: ANTHROPIC_API_KEY env, else
+# this file's contents. Missing/empty => not injected (bash-only VMs are unaffected).
+RUNNER_ENV_FILE = os.environ.get("FC_RUNNER_ENV_FILE", "/etc/fc-agent-runner/anthropic.env")
+
 # Opt-in: freeze the guest root fs around snapshot/create for a filesystem-consistent
 # overlay (chiefly for S3-archived disks). Off by default — for plain pause/resume the
 # atomic memory+disk snapshot is already consistent. See _pause_vm / _agent_fs_freeze.
@@ -466,6 +471,7 @@ async def _create_overlay(vm_id: str, size_mb: int):
     )
     await proc2.communicate()
     await _write_agent_token(vm_id)
+    await _write_runner_creds(vm_id)
 
 
 async def _write_agent_token(vm_id: str):
@@ -491,6 +497,61 @@ async def _write_agent_token(vm_id: str):
             tok_path = tok_dir / "token"
             tok_path.write_text(token)
             tok_path.chmod(0o600)
+        finally:
+            u = await asyncio.create_subprocess_exec(
+                "umount", str(mnt),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await u.communicate()
+    finally:
+        try:
+            mnt.rmdir()
+        except OSError:
+            pass
+
+
+async def _write_runner_creds(vm_id: str):
+    """Inject the in-VM agent runner's Anthropic credentials into the overlay at
+    /etc/fc-agent-runner/anthropic.env (0600) before boot. Best-effort and gated: skipped
+    when no key source is configured, so bash-only VMs are unaffected. Source: the
+    ANTHROPIC_API_KEY env var, else the host file RUNNER_ENV_FILE. (P2 will scope this to
+    agent sessions only; today it injects whenever a key source exists.)"""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        content = f"ANTHROPIC_API_KEY={key}\n"
+    else:
+        p = Path(RUNNER_ENV_FILE)
+        if not p.exists():
+            return
+        try:
+            content = p.read_text()
+        except Exception as e:
+            log.warning(f"runner creds read failed ({RUNNER_ENV_FILE}): {e}")
+            return
+    if not content.strip():
+        return
+    # Normalize to a safe KEY=VALUE env file: a bare key (no '=' on the first non-empty
+    # line) becomes ANTHROPIC_API_KEY=<key>, so the guest never has a stray value to source.
+    first = next((ln for ln in content.splitlines() if ln.strip()), "")
+    if "=" not in first:
+        content = f"ANTHROPIC_API_KEY={content.strip()}\n"
+    overlay = _overlay_path(vm_id)
+    mnt = Path(tempfile.mkdtemp(prefix="fc-runner-"))
+    try:
+        m = await asyncio.create_subprocess_exec(
+            "mount", "-o", "loop", str(overlay), str(mnt),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, merr = await m.communicate()
+        if m.returncode != 0:
+            log.warning(f"runner-creds mount failed for {vm_id}: {merr.decode(errors='replace')}")
+            return
+        try:
+            d = mnt / "etc" / "fc-agent-runner"
+            d.mkdir(parents=True, exist_ok=True)
+            envp = d / "anthropic.env"
+            envp.write_text(content)
+            envp.chmod(0o600)
         finally:
             u = await asyncio.create_subprocess_exec(
                 "umount", str(mnt),
