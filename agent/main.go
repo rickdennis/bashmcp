@@ -8,6 +8,14 @@
 //	POST   /exec_async             start a tmux-backed run -> {exec_id} (long-running/reattachable)
 //	GET    /exec_async/{id}?out=&err=   poll output from offsets -> {stdout,stderr,out_offset,err_offset,done,returncode}
 //	DELETE /exec_async/{id}        kill the tmux session + remove temp files
+//	POST   /agent/start            start the in-VM Claude agent runner for a session -> {session_id,started}
+//	POST   /agent/input            append a user message to the runner's input -> {ok}
+//	GET    /agent/events?session_id=&from=   drain the runner's stream-json events -> {stdout,offset,done,returncode}
+//	DELETE /agent/{id}             stop the runner (graceful stop hint + kill tmux + cleanup)
+//
+// The /agent/* endpoints are a typed wrapper over the SAME tmux + on-disk-file + offset
+// machinery as /exec_async (so the runner survives reconnect and VM pause/resume), purpose-
+// built for the persistent agent loop: the host no longer base64-appends to the input file.
 //
 // The async model owns a command's lifetime in tmux + on-disk files keyed by exec_id,
 // so a command survives a host reconnect AND a VM pause/resume: the host just re-polls
@@ -76,6 +84,10 @@ func main() {
 	mux.HandleFunc("DELETE /exec_async/{id}", withSourceIP(withToken(handleExecAsyncDelete)))
 	mux.HandleFunc("POST /fs_freeze", withSourceIP(withToken(handleFsFreeze)))
 	mux.HandleFunc("POST /fs_thaw", withSourceIP(withToken(handleFsThaw)))
+	mux.HandleFunc("POST /agent/start", withSourceIP(withToken(handleAgentStart)))
+	mux.HandleFunc("POST /agent/input", withSourceIP(withToken(handleAgentInput)))
+	mux.HandleFunc("GET /agent/events", withSourceIP(withToken(handleAgentEvents)))
+	mux.HandleFunc("DELETE /agent/{id}", withSourceIP(withToken(handleAgentStop)))
 
 	addr := ":" + *httpPort
 	log.Printf("fc-agent: control plane on %s (ws %s reserved), allow-from=%s, exec-ready=%v",
@@ -303,6 +315,130 @@ func handleFsThaw(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"frozen": false})
 }
 
+// ── in-VM Claude agent runner control plane ──────────────────────────────────
+//
+// A "session" runs one persistent `fc-agent-runner --session <sid>` process under tmux.
+// Its stdout is newline-delimited stream-json events captured to <agentPrefix><sid>.out;
+// the host drains them by byte offset (GET /agent/events). User turns are appended as
+// JSON lines to <runnerInputDir>/<sid>.in (POST /agent/input), which the runner tails.
+// Keyed by the host's session id (sesn_…), distinct from /exec_async's random exec ids.
+
+const agentPrefix = "/tmp/fcagent-" // per-session runner scratch: <prefix><sid>.{sh,out,err,done}
+const runnerInputDir = "/var/run/fc-agent-runner"
+
+type agentStartRequest struct {
+	SessionID string `json:"session_id"`
+}
+
+type agentInputRequest struct {
+	SessionID string `json:"session_id"`
+	Content   string `json:"content"`
+}
+
+func handleAgentStart(w http.ResponseWriter, r *http.Request) {
+	var req agentStartRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !validSessionID(req.SessionID) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	sid := req.SessionID
+	tmuxName := "fcagent-" + sid
+	// Idempotent / reconnect-safe: if the runner is already alive, don't relaunch.
+	if exec.Command("tmux", "has-session", "-t", tmuxName).Run() == nil {
+		writeJSON(w, map[string]any{"session_id": sid, "started": false, "already_running": true})
+		return
+	}
+	if err := os.MkdirAll(runnerInputDir, 0o755); err != nil {
+		http.Error(w, "mkdir input dir: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if f, err := os.OpenFile(runnerInputDir+"/"+sid+".in", os.O_CREATE|os.O_APPEND, 0o600); err == nil {
+		_ = f.Close()
+	}
+	outPath := agentPrefix + sid + ".out"
+	errPath := agentPrefix + sid + ".err"
+	donePath := agentPrefix + sid + ".done"
+	shPath := agentPrefix + sid + ".sh"
+	var sb strings.Builder
+	sb.WriteString("#!/bin/bash\n")
+	sb.WriteString(fmt.Sprintf("exec > %s 2> %s\n", outPath, errPath))
+	sb.WriteString(fmt.Sprintf("/usr/local/bin/fc-agent-runner --session %s\n", shQuote(sid)))
+	sb.WriteString(fmt.Sprintf("echo $? > %s\n", donePath))
+	if err := os.WriteFile(shPath, []byte(sb.String()), 0o700); err != nil {
+		http.Error(w, "write wrapper: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	launch := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "bash "+shPath)
+	if out, err := launch.CombinedOutput(); err != nil {
+		http.Error(w, "tmux launch failed: "+err.Error()+": "+string(out), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"session_id": sid, "started": true})
+}
+
+func handleAgentInput(w http.ResponseWriter, r *http.Request) {
+	var req agentInputRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !validSessionID(req.SessionID) || req.Content == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := os.MkdirAll(runnerInputDir, 0o755); err != nil {
+		http.Error(w, "mkdir input dir: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	line, _ := json.Marshal(map[string]string{"content": req.Content}) // safely JSON-encoded
+	f, err := os.OpenFile(runnerInputDir+"/"+req.SessionID+".in", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		http.Error(w, "open input: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		http.Error(w, "write input: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func handleAgentEvents(w http.ResponseWriter, r *http.Request) {
+	sid := r.URL.Query().Get("session_id")
+	if !validSessionID(sid) {
+		http.Error(w, "bad session_id", http.StatusBadRequest)
+		return
+	}
+	chunk, newOff := readFrom(agentPrefix+sid+".out", queryInt(r, "from"))
+	done := false
+	rc := -1
+	if b, err := os.ReadFile(agentPrefix + sid + ".done"); err == nil {
+		done = true
+		if n, e := strconv.Atoi(strings.TrimSpace(string(b))); e == nil {
+			rc = n
+		}
+	}
+	writeJSON(w, map[string]any{"stdout": chunk, "offset": newOff, "done": done, "returncode": rc})
+}
+
+func handleAgentStop(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("id")
+	if !validSessionID(sid) {
+		http.Error(w, "bad id", http.StatusBadRequest)
+		return
+	}
+	// Graceful stop hint (the runner ends its query loop on {"type":"stop"}), then force-kill.
+	if f, err := os.OpenFile(runnerInputDir+"/"+sid+".in", os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+		_, _ = f.WriteString(`{"type":"stop"}` + "\n")
+		_ = f.Close()
+	}
+	_ = exec.Command("tmux", "kill-session", "-t", "fcagent-"+sid).Run()
+	for _, p := range []string{
+		agentPrefix + sid + ".sh", agentPrefix + sid + ".out", agentPrefix + sid + ".err",
+		agentPrefix + sid + ".done", runnerInputDir + "/" + sid + ".in",
+	} {
+		_ = os.Remove(p)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 func reqTimeout(req execRequest) int {
@@ -367,6 +503,21 @@ func validID(id string) bool {
 	}
 	for _, c := range id {
 		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// validSessionID gates the /agent/* session key (a host session id like "sesn_<hex>"):
+// safe for filenames and shell args — [A-Za-z0-9_-], 1..64 chars.
+func validSessionID(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') || c == '_' || c == '-') {
 			return false
 		}
 	}

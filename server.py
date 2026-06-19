@@ -1587,28 +1587,46 @@ def _agent_snapshot(agent: Dict, version: Optional[int] = None) -> Dict:
     return snap
 
 
-async def _agent_exec_async_start(vm_id: str, command: str, timeout: int = 86400) -> str:
-    """Start a long-running command via fc-agent /exec_async and return its exec_id WITHOUT
-    draining (used for the persistent agent runner)."""
-    record = _vm_state.get(vm_id) or {}
-    token = record.get("agent_token", "")
-    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/exec_async"
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.post(url, json={"command": command, "timeout_secs": timeout},
-                              headers={"Authorization": f"Bearer {token}"})
-    r.raise_for_status()
-    return r.json()["exec_id"]
+def _agent_headers(vm_id: str) -> Dict[str, str]:
+    return {"Authorization": f"Bearer {(_vm_state.get(vm_id) or {}).get('agent_token', '')}"}
 
 
-async def _agent_poll(vm_id: str, exec_id: str, out_off: int) -> Dict[str, Any]:
-    record = _vm_state.get(vm_id) or {}
-    token = record.get("agent_token", "")
-    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/exec_async/{exec_id}"
+async def _agent_runner_start(vm_id: str, sid: str) -> Dict[str, Any]:
+    """Start the persistent in-VM Claude agent runner for a session via the typed
+    fc-agent /agent/start endpoint (idempotent / reconnect-safe)."""
+    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/agent/start"
     async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(url, params={"out": out_off, "err": 0},
-                             headers={"Authorization": f"Bearer {token}"})
+        r = await client.post(url, json={"session_id": sid}, headers=_agent_headers(vm_id))
     r.raise_for_status()
     return r.json()
+
+
+async def _agent_runner_input(vm_id: str, sid: str, content: str) -> None:
+    """Append a user message (drive a turn) via fc-agent /agent/input — fc-agent JSON-encodes
+    it onto the runner's input file, so no host-side base64/quoting is needed."""
+    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/agent/input"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, json={"session_id": sid, "content": content},
+                              headers=_agent_headers(vm_id))
+    r.raise_for_status()
+
+
+async def _agent_runner_events(vm_id: str, sid: str, from_off: int) -> Dict[str, Any]:
+    """Drain the runner's stream-json events from a byte offset via fc-agent /agent/events.
+    Returns {stdout, offset, done, returncode}."""
+    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/agent/events"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(url, params={"session_id": sid, "from": from_off},
+                             headers=_agent_headers(vm_id))
+    r.raise_for_status()
+    return r.json()
+
+
+async def _agent_runner_stop(vm_id: str, sid: str) -> None:
+    """Stop the runner (graceful stop hint + kill + cleanup) via fc-agent DELETE /agent/{sid}."""
+    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/agent/{sid}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        await client.delete(url, headers=_agent_headers(vm_id))
 
 
 async def _agent_b64write(vm_id: str, path: str, content: str, append: bool = False):
@@ -1754,12 +1772,12 @@ async def _create_agent_session(agent_id: str, title: Optional[str] = None,
         cfg["allowedTools"] = tools
     await _agent_b64write(vm_id, "/etc/fc-agent-runner/agent.json", json.dumps(cfg))
     provisioned = await _provision_resources(vm_id, resources or [])  # clone repos / drop files first
-    exec_id = await _agent_exec_async_start(vm_id, f"fc-agent-runner --session {sid}")
+    await _agent_runner_start(vm_id, sid)  # typed /agent/start; events keyed by sid
     rec = {"id": sid, "type": "session", "agent_id": agent_id,
            "agent_version": snap.get("version"), "agent_snapshot": snap,
            "environment_id": environment_id, "vm_id": vm_id, "status": "idle",
-           "runner_exec_id": exec_id, "title": title, "resources": provisioned,
-           "usage": _zero_usage(),
+           "title": title, "resources": provisioned,
+           "usage": _zero_usage(), "events_offset": 0,
            "created_at": time.time(), "updated_at": time.time()}
     AGENT_SESSIONS.put(sid, rec)
     return rec
@@ -1770,11 +1788,58 @@ async def _session_send(sid: str, content: str) -> Dict:
     if not rec:
         raise KeyError(f"session '{sid}' not found")
     _touch(rec["vm_id"])  # keep the VM alive while a turn runs
-    await _agent_b64write(rec["vm_id"], f"/var/run/fc-agent-runner/{sid}.in",
-                          json.dumps({"content": content}) + "\n", append=True)
+    await _agent_runner_input(rec["vm_id"], sid, content)  # typed /agent/input
     rec["status"] = "running"; rec["updated_at"] = time.time()
     AGENT_SESSIONS.put(sid, rec)
     return rec
+
+
+async def _drive_turn(sid: str, content: str, timeout: float = 300.0) -> Dict:
+    """Send a message and block until that turn's 'result' event, returning {result, events}.
+    Tracks the session's consumed byte offset (events_offset) so multi-turn sessions resume
+    from the right place instead of replaying a prior turn's result."""
+    rec = AGENT_SESSIONS.get(sid)
+    if not rec:
+        raise KeyError(f"session '{sid}' not found")
+    start_off = int(rec.get("events_offset", 0))
+    await _session_send(sid, content)
+    vm_id = rec["vm_id"]
+    out_off, buf, last, result, n = start_off, "", time.time(), None, 0
+    while time.time() - last < timeout:
+        try:
+            d = await _agent_runner_events(vm_id, sid, out_off)
+        except Exception:
+            await asyncio.sleep(0.4)
+            continue
+        chunk = d.get("stdout", "")
+        out_off = d.get("offset", out_off)
+        done_turn = False
+        if chunk:
+            last = time.time()
+            buf += chunk
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                n += 1
+                if ev.get("type") == "result":
+                    result = ev.get("result")
+                    done_turn = True
+                    break
+        if done_turn or d.get("done"):
+            break
+        await asyncio.sleep(0.3)
+    r2 = AGENT_SESSIONS.get(sid)
+    if r2:
+        r2["events_offset"] = out_off
+        r2["status"] = "idle"
+        r2["updated_at"] = time.time()
+        AGENT_SESSIONS.put(sid, r2)
+    return {"result": result, "events": n, "offset": out_off}
 
 
 async def _stream_session_events(sid: str, from_off: int = 0, max_idle: float = 300.0):
@@ -1783,16 +1848,16 @@ async def _stream_session_events(sid: str, from_off: int = 0, max_idle: float = 
     rec = AGENT_SESSIONS.get(sid)
     if not rec:
         return
-    vm_id, exec_id = rec["vm_id"], rec["runner_exec_id"]
+    vm_id = rec["vm_id"]
     out_off, buf, last = from_off, "", time.time()
     while time.time() - last < max_idle:
         try:
-            d = await _agent_poll(vm_id, exec_id, out_off)
+            d = await _agent_runner_events(vm_id, sid, out_off)
         except Exception:
             await asyncio.sleep(0.4)
             continue
         chunk = d.get("stdout", "")
-        out_off = d.get("out_offset", out_off)
+        out_off = d.get("offset", out_off)
         if chunk:
             last = time.time()
             buf += chunk
@@ -2013,15 +2078,15 @@ async def _replay_events(sid: str) -> List[Dict]:
     rec = AGENT_SESSIONS.get(sid)
     if not rec:
         return []
-    vm_id, exec_id = rec["vm_id"], rec["runner_exec_id"]
+    vm_id = rec["vm_id"]
     out_off, buf, events = 0, "", []
     for _ in range(60):
         try:
-            d = await _agent_poll(vm_id, exec_id, out_off)
+            d = await _agent_runner_events(vm_id, sid, out_off)
         except Exception:
             break
         new = d.get("stdout", "")
-        out_off = d.get("out_offset", out_off)
+        out_off = d.get("offset", out_off)
         buf += new
         while "\n" in buf:
             line, buf = buf.split("\n", 1)
@@ -2114,26 +2179,73 @@ async def api_session_usage(sid: str):
 )
 async def agent_run(params: AgentRunInput, ctx: Context) -> str:
     """Boot a microVM running the Claude Agent SDK from the given agent definition, send one
-    prompt, and return the agent's final result. JSON: {session_id, vm_id, result, events}."""
+    prompt, and return the agent's final result. JSON: {session_id, vm_id, result, events, usage}.
+    For multi-turn use, prefer agent_session_create + agent_send_message."""
     try:
         rec = await _create_agent_session(params.agent_id, title="agent_run")
     except (KeyError, ValueError) as e:
         return json.dumps({"error": str(e)})
     sid = rec["id"]
-    await _session_send(sid, params.prompt)
-    result, usage, n = None, None, 0
-    async for ev in _stream_session_events(sid, from_off=0, max_idle=params.timeout):
-        n += 1
-        if ev.get("type") == "result":
-            result = ev.get("result")
-            usage = _usage_from_result(ev)
-            break
+    turn = await _drive_turn(sid, params.prompt, timeout=params.timeout)
+    usage = None
     try:
         usage = await _refresh_session_usage(sid)
     except Exception:
         pass
-    return json.dumps({"session_id": sid, "vm_id": rec["vm_id"], "result": result,
-                       "events": n, "usage": usage}, indent=2)
+    return json.dumps({"session_id": sid, "vm_id": rec["vm_id"], "result": turn["result"],
+                       "events": turn["events"], "usage": usage}, indent=2)
+
+
+class AgentSessionCreateToolInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., min_length=1)
+    agent_version: Optional[int] = Field(default=None, ge=1)
+    environment_id: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=200)
+
+
+class AgentSendMessageInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    session_id: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1, max_length=100000)
+    timeout: int = Field(default=300, ge=1, le=3600)
+
+
+@mcp.tool(
+    name="agent_session_create",
+    annotations={"title": "Create a persistent Claude agent session (microVM)", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+async def agent_session_create(params: AgentSessionCreateToolInput, ctx: Context) -> str:
+    """Boot a microVM running the Claude Agent SDK from an agent definition and keep it warm for
+    multi-turn use. Returns JSON {session_id, vm_id, status}. Drive turns with agent_send_message."""
+    try:
+        rec = await _create_agent_session(params.agent_id, params.title,
+                                          params.environment_id, params.agent_version)
+    except (KeyError, ValueError) as e:
+        return json.dumps({"error": str(e)})
+    return json.dumps({"session_id": rec["id"], "vm_id": rec["vm_id"], "status": rec["status"]}, indent=2)
+
+
+@mcp.tool(
+    name="agent_send_message",
+    annotations={"title": "Send a message to a Claude agent session", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+async def agent_send_message(params: AgentSendMessageInput, ctx: Context) -> str:
+    """Send a user message to an existing agent session (conversation state is retained across
+    turns) and return that turn's final result. JSON {session_id, result, events, usage}."""
+    try:
+        turn = await _drive_turn(params.session_id, params.content, timeout=params.timeout)
+    except KeyError as e:
+        return json.dumps({"error": str(e)})
+    usage = None
+    try:
+        usage = await _refresh_session_usage(params.session_id)
+    except Exception:
+        pass
+    return json.dumps({"session_id": params.session_id, "result": turn["result"],
+                       "events": turn["events"], "usage": usage}, indent=2)
 
 
 # ─── Entry Point ───────────────────────────────────────────────────────────────
