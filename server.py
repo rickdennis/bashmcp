@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import base64
 import secrets
+import shlex
 import tempfile
 import time
 import uuid
@@ -20,7 +21,8 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
+from urllib.parse import urlparse
 
 import httpx
 import uvicorn
@@ -1637,9 +1639,92 @@ async def _create_and_boot_vm(name: str, vcpu: int, mem_mb: int, disk_mb: int) -
     return vm_id
 
 
+async def _provision_resources(vm_id: str, resources: List[Dict]) -> List[Dict]:
+    """Materialize session resources into the VM before the agent runs. Returns sanitized
+    resource records to store on the session — the authorization_token is NEVER returned or
+    persisted. A git token is injected via a short-lived credential file written over the
+    fc-agent body (base64, not in the visible command) and shredded right after the clone."""
+    out: List[Dict] = []
+    for r in resources:
+        rtype = r.get("type")
+        if rtype == "github_repository":
+            url = r["repository_url"]
+            if not url.startswith(("http://", "https://", "git@")):
+                url = f"https://github.com/{url}"  # owner/repo shorthand
+            repo_name = url.rstrip("/").split("/")[-1]
+            if repo_name.endswith(".git"):
+                repo_name = repo_name[:-4]
+            target = r.get("target_dir") or f"/workspace/{repo_name}"
+            token = r.get("authorization_token")
+            branch_arg = f"-b {shlex.quote(r['branch'])} " if r.get("branch") else ""
+            if token:
+                host = urlparse(url).hostname or "github.com"
+                await _agent_b64write(vm_id, "/root/.git-credentials",
+                                      f"https://x-access-token:{token}@{host}\n")
+            clone = (f"mkdir -p /workspace && HOME=/root git -c credential.helper=store "
+                     f"clone --depth 1 {branch_arg}{shlex.quote(url)} {shlex.quote(target)}")
+            cmd = clone + ("; rc=$?; shred -u /root/.git-credentials 2>/dev/null || "
+                           "rm -f /root/.git-credentials; exit $rc" if token else "")
+            res = await _agent_exec(vm_id, cmd, timeout=300)
+            if res.get("returncode") != 0:
+                raise RuntimeError(f"git clone failed for {url}: {(res.get('stderr') or '')[:300]}")
+            out.append({"type": "github_repository", "repository_url": url,
+                        "target_dir": target, "branch": r.get("branch")})
+        elif rtype == "file":
+            await _agent_b64write(vm_id, r["path"], r.get("content", ""))
+            out.append({"type": "file", "path": r["path"]})
+    return out
+
+
+def _zero_usage() -> Dict:
+    return {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0, "total_cost_usd": 0.0, "turns": 0}
+
+
+def _usage_from_result(ev: Dict) -> Dict:
+    """Pull this turn's usage out of an SDK 'result' event."""
+    u = ev.get("usage") or {}
+    return {"input_tokens": int(u.get("input_tokens", 0) or 0),
+            "output_tokens": int(u.get("output_tokens", 0) or 0),
+            "cache_read_input_tokens": int(u.get("cache_read_input_tokens", 0) or 0),
+            "cache_creation_input_tokens": int(u.get("cache_creation_input_tokens", 0) or 0),
+            "total_cost_usd": float(ev.get("total_cost_usd", 0.0) or 0.0)}
+
+
+async def _refresh_session_usage(sid: str) -> Dict:
+    """Recompute absolute session usage by summing every 'result' event in the runner's output
+    (idempotent — never double-counts across re-streams). If the VM can't be polled (e.g. it's
+    paused) and we'd otherwise regress to zero, the last-known usage is kept."""
+    rec = AGENT_SESSIONS.get(sid)
+    if not rec:
+        raise KeyError(f"session '{sid}' not found")
+    events = await _replay_events(sid)
+    total = _zero_usage()
+    for ev in events:
+        if ev.get("type") == "result":
+            u = _usage_from_result(ev)
+            for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                      "cache_creation_input_tokens"):
+                total[k] += u[k]
+            total["total_cost_usd"] += u["total_cost_usd"]
+            total["turns"] += 1
+    prev = rec.get("usage") or _zero_usage()
+    if total["turns"] == 0 and prev.get("turns", 0) > 0:
+        return prev  # couldn't reach the VM; don't clobber a real total with zeros
+    rec["usage"] = total
+    rec["updated_at"] = time.time()
+    AGENT_SESSIONS.put(sid, rec)
+    return total
+
+
+# NOTE (deferred): managed-agents outcomes (user.define_outcome + outcome_evaluations) are not
+# implemented. They need a runner round-trip to score a session against declared success criteria;
+# tracked for a later phase alongside the custom-tool round-trip.
+
 async def _create_agent_session(agent_id: str, title: Optional[str] = None,
                                 environment_id: Optional[str] = None,
-                                agent_version: Optional[int] = None) -> Dict:
+                                agent_version: Optional[int] = None,
+                                resources: Optional[List[Dict]] = None) -> Dict:
     agent = AGENTS.get(agent_id)
     if not agent:
         raise KeyError(f"agent '{agent_id}' not found")
@@ -1668,12 +1753,13 @@ async def _create_agent_session(agent_id: str, title: Optional[str] = None,
     if tools:
         cfg["allowedTools"] = tools
     await _agent_b64write(vm_id, "/etc/fc-agent-runner/agent.json", json.dumps(cfg))
+    provisioned = await _provision_resources(vm_id, resources or [])  # clone repos / drop files first
     exec_id = await _agent_exec_async_start(vm_id, f"fc-agent-runner --session {sid}")
     rec = {"id": sid, "type": "session", "agent_id": agent_id,
            "agent_version": snap.get("version"), "agent_snapshot": snap,
            "environment_id": environment_id, "vm_id": vm_id, "status": "idle",
-           "runner_exec_id": exec_id, "title": title,
-           "usage": {"input_tokens": 0, "output_tokens": 0, "total_cost_usd": 0.0, "turns": 0},
+           "runner_exec_id": exec_id, "title": title, "resources": provisioned,
+           "usage": _zero_usage(),
            "created_at": time.time(), "updated_at": time.time()}
     AGENT_SESSIONS.put(sid, rec)
     return rec
@@ -1741,12 +1827,34 @@ class AgentUpdateInput(BaseModel):
     allowed_tools: Optional[List[str]] = None
 
 
+class GithubRepoResource(BaseModel):
+    """Clone a git repo into the session VM at create time (managed-agents github_repository)."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    type: Literal["github_repository"]
+    repository_url: str = Field(..., min_length=1, max_length=1024)  # https URL or owner/repo
+    authorization_token: Optional[str] = Field(default=None, max_length=500)  # PAT; never stored
+    branch: Optional[str] = Field(default=None, max_length=255)
+    target_dir: Optional[str] = Field(default=None, max_length=512)  # default /workspace/<repo>
+
+
+class FileResource(BaseModel):
+    """Write an inline file into the session VM at create time (managed-agents file)."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    type: Literal["file"]
+    path: str = Field(..., min_length=1, max_length=512)
+    content: str = Field(default="", max_length=1_000_000)
+
+
+ResourceInput = Annotated[Union[GithubRepoResource, FileResource], Field(discriminator="type")]
+
+
 class SessionCreateInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_id: str = Field(..., min_length=1)
     agent_version: Optional[int] = Field(default=None, ge=1)
     environment_id: Optional[str] = None
     title: Optional[str] = Field(default=None, max_length=200)
+    resources: Optional[List[ResourceInput]] = None
 
 
 class SessionUpdateInput(BaseModel):
@@ -1852,9 +1960,11 @@ async def api_agent_archive(agent_id: str):
 
 @api.post("/v1/sessions", status_code=201, tags=["Agent sessions"], summary="Create an agent session (boots a VM running the agent)")
 async def api_session_create(params: SessionCreateInput):
+    resources = [r.model_dump() for r in params.resources] if params.resources else None
     try:
         return await _create_agent_session(params.agent_id, params.title,
-                                           params.environment_id, params.agent_version)
+                                           params.environment_id, params.agent_version,
+                                           resources)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
@@ -1989,6 +2099,14 @@ async def api_session_events(sid: str):
     return {"data": await _replay_events(sid)}
 
 
+@api.get("/v1/sessions/{sid}/usage", tags=["Agent sessions"], summary="Get accumulated token usage + cost")
+async def api_session_usage(sid: str):
+    try:
+        return {"session_id": sid, "usage": await _refresh_session_usage(sid)}
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @mcp.tool(
     name="agent_run",
     annotations={"title": "Run a Claude agent in a microVM", "readOnlyHint": False,
@@ -2003,13 +2121,19 @@ async def agent_run(params: AgentRunInput, ctx: Context) -> str:
         return json.dumps({"error": str(e)})
     sid = rec["id"]
     await _session_send(sid, params.prompt)
-    result, n = None, 0
+    result, usage, n = None, None, 0
     async for ev in _stream_session_events(sid, from_off=0, max_idle=params.timeout):
         n += 1
         if ev.get("type") == "result":
             result = ev.get("result")
+            usage = _usage_from_result(ev)
             break
-    return json.dumps({"session_id": sid, "vm_id": rec["vm_id"], "result": result, "events": n}, indent=2)
+    try:
+        usage = await _refresh_session_usage(sid)
+    except Exception:
+        pass
+    return json.dumps({"session_id": sid, "vm_id": rec["vm_id"], "result": result,
+                       "events": n, "usage": usage}, indent=2)
 
 
 # ─── Entry Point ───────────────────────────────────────────────────────────────
