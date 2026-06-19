@@ -609,29 +609,79 @@ async def _wait_for_agent(vm_id: str, timeout: int = 30) -> bool:
 
 async def _agent_exec(vm_id: str, command: str, timeout: int = 60,
                       working_dir: Optional[str] = None) -> Dict[str, Any]:
-    """Run a command in the VM via the guest agent (HTTP control plane), replacing SSH.
-    Returns the same {stdout, stderr, returncode} contract as _ssh_exec. working_dir is
-    sent to the guest (which sets the child's cwd) rather than prepended as `cd … &&`."""
+    """Run a command in the VM via the guest agent, replacing SSH. Uses the async
+    (tmux-backed) path: start it (POST /exec_async -> exec_id) then poll /exec_async/{id}
+    from our last byte offsets until the .done sentinel appears, retrying transient
+    failures. Because the command's lifetime lives in tmux + on-disk files keyed by
+    exec_id, it survives a host reconnect AND a VM pause/resume (a paused VM simply
+    resumes answering the same exec_id). Returns the same {stdout, stderr, returncode}
+    contract as _ssh_exec; working_dir is applied in-guest."""
     record = _vm_state.get(vm_id) or {}
     token = record.get("agent_token", "")
-    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/exec"
+    base = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}"
+    headers = {"Authorization": f"Bearer {token}"}
     payload: Dict[str, Any] = {"command": command, "timeout_secs": timeout}
     if working_dir:
         payload["working_dir"] = working_dir
+
     try:
-        async with httpx.AsyncClient(timeout=timeout + 10) as client:
-            r = await client.post(url, json=payload,
-                                  headers={"Authorization": f"Bearer {token}"})
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            try:
+                r = await client.post(f"{base}/exec_async", json=payload, headers=headers)
+            except Exception as e:
+                return {"stdout": "", "stderr": f"agent connection failed: {e}", "returncode": -1}
+            if r.status_code != 200:
+                return {"stdout": "", "stderr": f"agent error {r.status_code}: {r.text}", "returncode": -1}
+            exec_id = r.json().get("exec_id")
+            if not exec_id:
+                return {"stdout": "", "stderr": "agent did not return an exec_id", "returncode": -1}
+
+            out_parts: List[str] = []
+            err_parts: List[str] = []
+            out_off = err_off = 0
+            rc = -1
+            done = False
+            # The in-guest `timeout` enforces the real limit; we allow extra grace for
+            # boot/poll/pause hiccups before giving up on the channel itself.
+            deadline = time.time() + timeout + 30
+            while time.time() < deadline:
+                try:
+                    p = await client.get(f"{base}/exec_async/{exec_id}",
+                                         params={"out": out_off, "err": err_off}, headers=headers)
+                    if p.status_code != 200:
+                        await asyncio.sleep(0.5)
+                        continue
+                    d = p.json()
+                except Exception:
+                    await asyncio.sleep(0.5)  # blip or paused VM — keep re-polling the same exec_id
+                    continue
+                if d.get("stdout"):
+                    out_parts.append(d["stdout"])
+                if d.get("stderr"):
+                    err_parts.append(d["stderr"])
+                out_off = d.get("out_offset", out_off)
+                err_off = d.get("err_offset", err_off)
+                if d.get("done"):
+                    rc = d.get("returncode", -1)
+                    done = True
+                    break
+                await asyncio.sleep(0.2)
+
+            try:
+                await client.delete(f"{base}/exec_async/{exec_id}", headers=headers)
+            except Exception:
+                pass
+
+            stdout = "".join(out_parts)
+            stderr = "".join(err_parts)
+            if not done or rc == 124:  # 124 = in-guest `timeout` killed it
+                if stderr and not stderr.endswith("\n"):
+                    stderr += "\n"
+                reason = "agent exec timed out" if not done else "command timed out"
+                return {"stdout": stdout, "stderr": stderr + reason, "returncode": -1}
+            return {"stdout": stdout, "stderr": stderr, "returncode": rc}
     except Exception as e:
-        return {"stdout": "", "stderr": f"agent connection failed: {e}", "returncode": -1}
-    if r.status_code != 200:
-        return {"stdout": "", "stderr": f"agent error {r.status_code}: {r.text}", "returncode": -1}
-    data = r.json()
-    return {
-        "stdout": data.get("stdout", ""),
-        "stderr": data.get("stderr", ""),
-        "returncode": data.get("returncode", -1),
-    }
+        return {"stdout": "", "stderr": f"agent exec failed: {e}", "returncode": -1}
 
 
 async def _allocate_and_create_record(vm_id: str, name: str, vcpu: int, mem_mb: int, disk_mb: int) -> Dict:
