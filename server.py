@@ -920,10 +920,15 @@ async def bash_exec(params: BashExecInput, ctx: Context) -> str:
     record = _vm_state.get(vm_id)
     if not record:
         return json.dumps({"error": f"VM '{vm_id}' not found."})
-    if record["status"] != "running":
+    if record["status"] == "paused":
+        try:
+            await api_vm_resume(vm_id)   # running a command auto-resumes a paused target VM
+            record = _vm_state.get(vm_id)
+        except Exception as e:
+            return json.dumps({"error": f"Could not resume paused VM '{vm_id}': {e}"})
+    if not record or record["status"] != "running":
         return json.dumps({
-            "error": f"VM is not running (status: {record['status']}). "
-                     f"Use POST /vms/{{vm_id}}/resume if paused."
+            "error": f"VM is not running (status: {record['status'] if record else 'missing'})."
         })
 
     _touch(vm_id)  # mark active so idle-pause won't reap it mid-use
@@ -1282,14 +1287,18 @@ async def api_vm_status(vm_id: str):
 async def api_vm_exec(vm_id: str, params: VmExecInput):
     """Run a command in a specific running VM, addressed by id (the fcctl control plane).
 
-    Mirrors bash_exec minus session resolution: 404 if the VM is unknown, 409 if it is not
-    running (no auto-create/resume). Admin-only by network position, like the rest of /vms/*.
+    Mirrors bash_exec minus session resolution: 404 if the VM is unknown; a paused VM is
+    auto-resumed first; 409 if it is otherwise not running (no auto-create). Admin-only by
+    network position, like the rest of /vms/*.
     """
     record = _vm_state.get(vm_id)
     if not record:
         raise HTTPException(status_code=404, detail=f"VM '{vm_id}' not found.")
-    if record["status"] != "running":
-        raise HTTPException(status_code=409, detail=f"VM is not running (status: {record['status']}).")
+    if record["status"] == "paused":
+        await api_vm_resume(vm_id)   # running a command auto-resumes a paused target VM
+        record = _vm_state.get(vm_id)
+    if not record or record["status"] != "running":
+        raise HTTPException(status_code=409, detail=f"VM is not running (status: {record['status'] if record else 'missing'}).")
     _touch(vm_id)
     start = time.time()
     result = await _agent_exec(vm_id, params.command, timeout=params.timeout, working_dir=params.working_dir)
