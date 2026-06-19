@@ -18,11 +18,6 @@ _fc_arch="$(case "$(uname -m)" in aarch64|arm64) echo arm64;; *) echo amd64;; es
 FC_AGENT_BIN="${FC_AGENT_BIN:-$SCRIPT_DIR/bin/fc-agent-$_fc_arch}"   # built by build-agent.sh
 
 command -v docker >/dev/null || { echo "ERROR: docker is required"; exit 1; }
-[[ -f "$PUBKEY" ]] || {
-    echo "ERROR: $PUBKEY missing. Generate the keypair first:"
-    echo "  ssh-keygen -t ed25519 -f $BASE_DIR/vm_ssh_key -N ''"
-    exit 1
-}
 
 mkdir -p "$IMAGES_DIR"
 BUILD=$(mktemp -d)
@@ -30,32 +25,22 @@ MNT=$(mktemp -d)
 cleanup() { mountpoint -q "$MNT" && umount "$MNT"; rm -rf "$BUILD" "$MNT"; }
 trap cleanup EXIT
 
-cp "$PUBKEY" "$BUILD/authorized_keys"
-
 cat > "$BUILD/Dockerfile" <<'DOCKER'
 FROM ubuntu:22.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      systemd systemd-sysv openssh-server sudo bash tmux \
+      systemd systemd-sysv sudo bash tmux \
       curl wget vim git htop net-tools iproute2 iputils-ping ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-# sshd: root login, pubkey only
-RUN sed -i 's/#\?PermitRootLogin.*/PermitRootLogin yes/'            /etc/ssh/sshd_config \
- && sed -i 's/#\?PubkeyAuthentication.*/PubkeyAuthentication yes/'  /etc/ssh/sshd_config \
- && sed -i 's/#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
- && ssh-keygen -A \
- && ln -sf /lib/systemd/system/ssh.service /etc/systemd/system/multi-user.target.wants/ssh.service \
- && mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d \
+# No sshd: command exec goes through fc-agent (added below). Serial getty kept for debug.
+RUN mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d \
  && printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclear %%I 115200 linux\n' \
       > /etc/systemd/system/serial-getty@ttyS0.service.d/override.conf \
  && echo fc-vm > /etc/hostname \
- && echo 'LABEL=rootfs / ext4 defaults,errors=remount-ro 0 1' > /etc/fstab \
- && mkdir -p /root/.ssh && chmod 700 /root/.ssh
-COPY authorized_keys /root/.ssh/authorized_keys
-RUN chmod 600 /root/.ssh/authorized_keys
+ && echo 'LABEL=rootfs / ext4 defaults,errors=remount-ro 0 1' > /etc/fstab
 DOCKER
 
 # Bake in the fc-agent guest agent (HTTP command exec; replaces SSH). Build it first
-# with: bash build-agent.sh. sshd stays as a debug fallback until a later phase.
+# with: bash build-agent.sh (produces the per-arch binaries in bin/).
 if [[ -f "$FC_AGENT_BIN" ]]; then
     echo "==> including fc-agent in the image"
     cp "$FC_AGENT_BIN" "$BUILD/fc-agent"

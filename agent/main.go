@@ -34,6 +34,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -73,6 +74,8 @@ func main() {
 	mux.HandleFunc("POST /exec_async", withSourceIP(withToken(handleExecAsyncStart)))
 	mux.HandleFunc("GET /exec_async/{id}", withSourceIP(withToken(handleExecAsyncPoll)))
 	mux.HandleFunc("DELETE /exec_async/{id}", withSourceIP(withToken(handleExecAsyncDelete)))
+	mux.HandleFunc("POST /fs_freeze", withSourceIP(withToken(handleFsFreeze)))
+	mux.HandleFunc("POST /fs_thaw", withSourceIP(withToken(handleFsThaw)))
 
 	addr := ":" + *httpPort
 	log.Printf("fc-agent: control plane on %s (ws %s reserved), allow-from=%s, exec-ready=%v",
@@ -251,6 +254,53 @@ func handleExecAsyncDelete(w http.ResponseWriter, r *http.Request) {
 		_ = os.Remove(tmpPrefix + id + ext)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ── filesystem freeze/thaw for crash-consistent snapshots ────────────────────
+//
+// FIFREEZE (via fsfreeze) flushes dirty data and blocks new writers until thaw, so a
+// snapshot taken in between captures a consistent on-disk filesystem. CRITICAL: the
+// agent runs from / and must NOT write to / between freeze and thaw, or it self-
+// deadlocks. Serving HTTP (/health, /fs_thaw) and logging to the console are reads/
+// device writes, not filesystem writes, so the agent stays responsive while frozen and
+// can thaw itself. An auto-thaw watchdog guards against a host that crashes before
+// calling /fs_thaw (which would otherwise leave a live guest hung on its next write).
+
+var (
+	freezeMu  sync.Mutex
+	thawTimer *time.Timer
+)
+
+func handleFsFreeze(w http.ResponseWriter, r *http.Request) {
+	watchdog := queryInt(r, "watchdog")
+	if watchdog <= 0 {
+		watchdog = 60
+	}
+	freezeMu.Lock()
+	defer freezeMu.Unlock()
+	if out, err := exec.Command("fsfreeze", "-f", "/").CombinedOutput(); err != nil {
+		http.Error(w, "freeze failed: "+err.Error()+": "+string(out), http.StatusInternalServerError)
+		return
+	}
+	if thawTimer != nil {
+		thawTimer.Stop()
+	}
+	thawTimer = time.AfterFunc(time.Duration(watchdog)*time.Second, func() {
+		_ = exec.Command("fsfreeze", "-u", "/").Run()
+	})
+	writeJSON(w, map[string]any{"frozen": true, "watchdog_secs": watchdog})
+}
+
+func handleFsThaw(w http.ResponseWriter, r *http.Request) {
+	freezeMu.Lock()
+	defer freezeMu.Unlock()
+	if thawTimer != nil {
+		thawTimer.Stop()
+		thawTimer = nil
+	}
+	// Thawing a non-frozen fs returns EINVAL; ignore it so thaw is idempotent.
+	_ = exec.Command("fsfreeze", "-u", "/").Run()
+	writeJSON(w, map[string]any{"frozen": false})
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

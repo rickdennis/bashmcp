@@ -68,6 +68,11 @@ IDLE_CHECK_INTERVAL = int(os.environ.get("FC_IDLE_CHECK_INTERVAL", "30"))
 # Guest agent (fc-agent) control-plane HTTP port — replaces SSH for command exec.
 AGENT_HTTP_PORT = int(os.environ.get("FC_AGENT_HTTP_PORT", "2025"))
 
+# Opt-in: freeze the guest root fs around snapshot/create for a filesystem-consistent
+# overlay (chiefly for S3-archived disks). Off by default — for plain pause/resume the
+# atomic memory+disk snapshot is already consistent. See _pause_vm / _agent_fs_freeze.
+FS_FREEZE_ON_SNAPSHOT = os.environ.get("FC_FS_FREEZE_ON_SNAPSHOT", "").lower() in ("1", "true", "yes")
+
 # Optional S3 archival of paused-VM snapshots, so a paused VM survives node loss and
 # can be restored on a survivor node. Disabled when FC_S3_BUCKET is unset. Credentials
 # come from the boto3 default chain (EC2 instance role via IMDS on the host; IRSA/Secret
@@ -550,44 +555,8 @@ async def _launch_firecracker(vm_id: str, vcpu: int, mem_mb: int) -> int:
     return fc_proc.pid
 
 
-async def _wait_for_ssh(vm_id: str, timeout: int = 30) -> bool:
-    ip = _vm_ip(vm_id)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, 22), timeout=2
-            )
-            writer.close()
-            await writer.wait_closed()
-            return True
-        except Exception:
-            await asyncio.sleep(1)
-    return False
-
-
-async def _ssh_exec(vm_id: str, command: str, timeout: int = 60) -> Dict[str, Any]:
-    proc = await asyncio.create_subprocess_exec(
-        "ssh",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=10",
-        "-i", str(SSH_KEY_PATH),
-        f"root@{_vm_ip(vm_id)}",
-        command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return {
-            "stdout": stdout.decode(errors="replace"),
-            "stderr": stderr.decode(errors="replace"),
-            "returncode": proc.returncode,
-        }
-    except asyncio.TimeoutError:
-        proc.kill()
-        return {"stdout": "", "stderr": "Command timed out", "returncode": -1}
+# SSH command/readiness path removed — all command execution and readiness go through
+# the guest agent (_wait_for_agent / _agent_exec below). The guest no longer runs sshd.
 
 
 async def _wait_for_agent(vm_id: str, timeout: int = 30) -> bool:
@@ -684,6 +653,36 @@ async def _agent_exec(vm_id: str, command: str, timeout: int = 60,
         return {"stdout": "", "stderr": f"agent exec failed: {e}", "returncode": -1}
 
 
+async def _agent_fs_freeze(vm_id: str) -> bool:
+    """Best-effort: freeze the guest root fs so the snapshot's overlay is filesystem-
+    consistent. The agent arms an auto-thaw watchdog in case we never thaw (host crash)."""
+    record = _vm_state.get(vm_id) or {}
+    token = record.get("agent_token", "")
+    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/fs_freeze"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(url, headers={"Authorization": f"Bearer {token}"})
+        return r.status_code == 200
+    except Exception as e:
+        log.warning(f"fs_freeze failed for {vm_id}: {e}")
+        return False
+
+
+async def _agent_fs_thaw(vm_id: str) -> bool:
+    """Best-effort, idempotent: thaw the guest root fs after resuming a VM whose snapshot
+    was taken frozen (the restored guest kernel still has the superblock frozen)."""
+    record = _vm_state.get(vm_id) or {}
+    token = record.get("agent_token", "")
+    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/fs_thaw"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(url, headers={"Authorization": f"Bearer {token}"})
+        return r.status_code == 200
+    except Exception as e:
+        log.warning(f"fs_thaw failed for {vm_id}: {e}")
+        return False
+
+
 async def _allocate_and_create_record(vm_id: str, name: str, vcpu: int, mem_mb: int, disk_mb: int) -> Dict:
     """Atomically allocate a slot and persist a 'creating' record.
 
@@ -758,6 +757,8 @@ async def _resolve_session_vm(session_id: str) -> str:
                 finally:
                     await fc.close()
                 await _wait_for_agent(vm_id, timeout=30)
+                if FS_FREEZE_ON_SNAPSHOT:
+                    await _agent_fs_thaw(vm_id)
                 _vm_state.update(vm_id, {"status": "running"})
                 return vm_id
 
@@ -1117,7 +1118,6 @@ def _readiness_checks() -> Dict[str, bool]:
         "reconciled": _ready,
         "kernel_image": KERNEL_IMAGE.exists(),
         "base_rootfs": BASE_ROOTFS.exists(),
-        "ssh_key": SSH_KEY_PATH.exists(),
         "bridge_up": _bridge_up(),
         "free_slots": _slots.free_count() > 0,
     }
@@ -1318,6 +1318,12 @@ async def _pause_vm(vm_id: str, archive: bool = True) -> Dict:
 
     try:
         fc = FirecrackerClient(_socket_path(vm_id))
+        if FS_FREEZE_ON_SNAPSHOT:
+            # Freeze before pausing so the captured overlay is fs-consistent. The
+            # snapshot's *memory* image is therefore frozen too → resume must thaw
+            # (see _resolve_session_vm / api_vm_resume). The VM is killed right after,
+            # so no thaw is needed here; the agent's watchdog covers a crash before kill.
+            await _agent_fs_freeze(vm_id)
         await fc.patch("/vm", {"state": "Paused"})
         await fc.put("/snapshot/create", {
             "snapshot_type": "Full", "snapshot_path": state_path, "mem_file_path": mem_path,
@@ -1398,6 +1404,8 @@ async def api_vm_resume(vm_id: str):
         await fc.close()
 
         ready = await _wait_for_agent(vm_id, timeout=30)
+        if FS_FREEZE_ON_SNAPSHOT:
+            await _agent_fs_thaw(vm_id)
         _vm_state.update(vm_id, {"status": "running", "pid": fc_proc.pid})
 
         return {

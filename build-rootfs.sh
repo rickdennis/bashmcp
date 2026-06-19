@@ -25,7 +25,7 @@ echo "==> Mounting image..."
 mount -o loop "$ROOTFS" "$MOUNT_DIR"
 
 echo "==> Running debootstrap (Ubuntu 22.04 jammy)..."
-debootstrap --include=openssh-server,curl,wget,vim,git,htop,net-tools,iproute2,iputils-ping,sudo,bash,systemd,tmux \
+debootstrap --include=curl,wget,vim,git,htop,net-tools,iproute2,iputils-ping,sudo,bash,systemd,tmux \
     jammy "$MOUNT_DIR" http://archive.ubuntu.com/ubuntu/
 
 # ── 3. Configure the system ───────────────────────────────────────────────────
@@ -47,25 +47,11 @@ auto eth0
 iface eth0 inet dhcp
 EOF
 
-# SSH config - allow root login with key
-mkdir -p "$MOUNT_DIR/root/.ssh"
-chmod 700 "$MOUNT_DIR/root/.ssh"
-
-# If we have a public key, install it
-if [[ -f "$BASE_DIR/vm_ssh_key.pub" ]]; then
-    cp "$BASE_DIR/vm_ssh_key.pub" "$MOUNT_DIR/root/.ssh/authorized_keys"
-    chmod 600 "$MOUNT_DIR/root/.ssh/authorized_keys"
-fi
-
-# Allow root SSH login
-sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' "$MOUNT_DIR/etc/ssh/sshd_config"
-sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' "$MOUNT_DIR/etc/ssh/sshd_config"
-sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' "$MOUNT_DIR/etc/ssh/sshd_config"
+# No sshd: command exec goes through fc-agent (installed below). Serial getty kept for debug.
 
 # ── fc-agent guest agent (HTTP command exec; replaces SSH) ────────────────────
 # The host drives commands into the VM via this agent over the tap instead of SSH.
-# Build it first with: bash build-agent.sh  (produces bin/fc-agent). Keep sshd as a
-# debug fallback for now; it is removed in a later phase.
+# Build it first with: bash build-agent.sh (produces the per-arch binaries in bin/).
 _fc_arch="$(case "$(uname -m)" in aarch64|arm64) echo arm64;; *) echo amd64;; esac)"
 FC_AGENT_BIN="${FC_AGENT_BIN:-$SCRIPT_DIR/bin/fc-agent-$_fc_arch}"
 if [[ -f "$FC_AGENT_BIN" ]]; then
