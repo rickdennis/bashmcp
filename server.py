@@ -1739,20 +1739,24 @@ async def _refresh_session_usage(sid: str) -> Dict:
 # implemented. They need a runner round-trip to score a session against declared success criteria;
 # tracked for a later phase alongside the custom-tool round-trip.
 
-async def _create_agent_session(agent_id: str, title: Optional[str] = None,
+async def _create_agent_session(agent_id: Optional[str] = None, title: Optional[str] = None,
                                 environment_id: Optional[str] = None,
                                 agent_version: Optional[int] = None,
-                                resources: Optional[List[Dict]] = None) -> Dict:
-    agent = AGENTS.get(agent_id)
+                                resources: Optional[List[Dict]] = None,
+                                agent: Optional[Dict] = None,
+                                environment: Optional[Dict] = None) -> Dict:
+    # agent/environment may be passed inline by the router (HA); otherwise resolved locally.
+    agent = agent or (AGENTS.get(agent_id) if agent_id else None)
     if not agent:
         raise KeyError(f"agent '{agent_id}' not found")
+    agent_id = agent.get("id", agent_id)
     if agent.get("archived_at"):
         raise ValueError(f"agent '{agent_id}' is archived")
     snap = _agent_snapshot(agent, agent_version)
     if agent_version is not None and not (agent.get("versions") or {}).get(str(agent_version)):
         raise KeyError(f"agent '{agent_id}' has no version {agent_version}")
-    env = None
-    if environment_id:
+    env = environment
+    if env is None and environment_id:
         env = ENVIRONMENTS.get(environment_id)
         if not env:
             raise KeyError(f"environment '{environment_id}' not found")
@@ -1915,11 +1919,16 @@ ResourceInput = Annotated[Union[GithubRepoResource, FileResource], Field(discrim
 
 class SessionCreateInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    agent_id: str = Field(..., min_length=1)
+    agent_id: Optional[str] = Field(default=None, min_length=1)
     agent_version: Optional[int] = Field(default=None, ge=1)
     environment_id: Optional[str] = None
     title: Optional[str] = Field(default=None, max_length=200)
     resources: Optional[List[ResourceInput]] = None
+    # Router-internal (HA): the router resolves the agent/environment definitions on whatever
+    # node owns them and passes them inline, so a session can run on any node regardless of
+    # where its agent/env were created. Ignored in the standalone agent_id flow.
+    agent: Optional[Dict[str, Any]] = None
+    environment: Optional[Dict[str, Any]] = None
 
 
 class SessionUpdateInput(BaseModel):
@@ -2029,7 +2038,7 @@ async def api_session_create(params: SessionCreateInput):
     try:
         return await _create_agent_session(params.agent_id, params.title,
                                            params.environment_id, params.agent_version,
-                                           resources)
+                                           resources, params.agent, params.environment)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:

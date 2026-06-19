@@ -39,8 +39,10 @@ async def load_config():
 
 
 def session_name(mcp_session_id: str) -> str:
-    """A DNS-safe CR name derived from the session id (uuid4 hex is already safe)."""
-    return f"s-{mcp_session_id.lower()}"[:253]
+    """A DNS-safe (RFC 1123) CR name derived from the session id. uuid4 hex is already safe;
+    agent-session ids ('sesn_<hex>') carry an underscore, which is invalid in an object name,
+    so it is mapped to '-'. The spec.mcpSessionId field keeps the original id verbatim."""
+    return f"s-{mcp_session_id.lower().replace('_', '-')}"[:253]
 
 
 class K8sClient:

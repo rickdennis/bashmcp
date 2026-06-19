@@ -17,8 +17,8 @@ from typing import Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field, ConfigDict
@@ -43,6 +43,13 @@ _cache: Optional[SessionCache] = None
 _placer: Optional[Placer] = None
 _elector: Optional[LeaderElector] = None
 _http: Optional[httpx.AsyncClient] = None
+
+# Agent definitions are node-local JSON stores; the router remembers which node owns each
+# agent (lazily, self-healing on a miss by scanning Ready nodes) so it can route an agent's
+# CRUD there and create a session on the agent's home node — where its local definition lives.
+# Environments are broadcast to every Ready node, so an environment_id resolves on any node.
+_agent_home: dict = {}  # agent_id -> nodeName
+_env_home: dict = {}    # env_id -> nodeName
 
 
 def _now():
@@ -237,6 +244,350 @@ async def metrics():
         f"fcmcp_router_cached_sessions {cached}",
     ]
     return PlainTextResponse("\n".join(lines) + "\n")
+
+
+# ─── Agent-sessions REST forwarding (managed-agents shape, HA) ────────────────────
+#
+# The node-agents own the data plane (agent/environment JSON stores + session VMs). The
+# router is the single front door: it forwards each agent's CRUD to the node that owns it
+# (home node, resolved lazily and self-healing), and creates a session on ANY node with
+# capacity by resolving the agent+environment definitions and passing them INLINE — so a
+# session is not tied to where its agent/env were created. Session ops then route to the
+# session's pinned node via the Session CR (keyed by the sesn_ id, same as bash_exec).
+
+def _require_leader():
+    if not (_elector and _elector.is_leader):
+        return JSONResponse(status_code=503,
+                            content={"error": "router not ready (leader election in progress); retry"})
+    return None
+
+
+def _ready_addrs():
+    """[(nodeName, podIP, freeTaps)] for every Ready node-agent."""
+    out = []
+    for a in _registry.agents():
+        status = a.get("status") or {}
+        if status.get("phase") != "Ready":
+            continue
+        node = a.get("spec", {}).get("nodeName")
+        addr = _registry.address(node)
+        if node and addr:
+            out.append((node, addr, int(status.get("freeTaps", 0))))
+    return out
+
+
+def _pick_node():
+    """The Ready node with the most free taps (None if the fleet is at capacity)."""
+    cands = sorted(_ready_addrs(), key=lambda t: t[2], reverse=True)
+    if not cands or cands[0][2] <= 0:
+        return None
+    return cands[0][0], cands[0][1]
+
+
+async def _resolve_agent_home(agent_id: str) -> Optional[str]:
+    """Which node owns this agent. Cached; on a miss, scan Ready nodes (self-healing across
+    a leader failover, since the cache is in-memory)."""
+    node = _agent_home.get(agent_id)
+    if node and _registry.address(node):
+        return node
+    for node, addr, _free in _ready_addrs():
+        try:
+            r = await _http.get(f"http://{addr}:{NODE_EXEC_PORT}/v1/agents/{agent_id}", timeout=10)
+            if r.status_code == 200:
+                _agent_home[agent_id] = node
+                return node
+        except httpx.HTTPError:
+            continue
+    return None
+
+
+def _json(r: httpx.Response) -> JSONResponse:
+    return JSONResponse(status_code=r.status_code, content=(r.json() if r.content else None))
+
+
+async def _forward_agent(agent_id: str, method: str, subpath: str, body=None) -> JSONResponse:
+    node = await _resolve_agent_home(agent_id)
+    if not node:
+        return JSONResponse(status_code=404, content={"error": f"agent '{agent_id}' not found"})
+    addr = _registry.address(node)
+    if not addr:
+        return JSONResponse(status_code=503, content={"error": "the agent's home node is unavailable"})
+    try:
+        r = await _http.request(method, f"http://{addr}:{NODE_EXEC_PORT}/v1/agents/{agent_id}{subpath}",
+                                json=body, timeout=30)
+    except httpx.HTTPError as e:
+        return JSONResponse(status_code=502, content={"error": f"forwarding failed: {e}"})
+    return _json(r)
+
+
+async def _forward_session(sid: str, method: str, subpath: str, body=None, timeout: float = 60) -> JSONResponse:
+    node = await _cache.get_node(sid)
+    if not node:
+        return JSONResponse(status_code=404, content={"error": f"session '{sid}' not found"})
+    addr = _registry.address(node)
+    if not addr:
+        return JSONResponse(status_code=503, content={"error": "the node hosting this session is unavailable"})
+    try:
+        r = await _http.request(method, f"http://{addr}:{NODE_EXEC_PORT}/v1/sessions/{sid}{subpath}",
+                                json=body, timeout=timeout)
+    except httpx.HTTPError as e:
+        return JSONResponse(status_code=502, content={"error": f"forwarding failed: {e}"})
+    return _json(r)
+
+
+# ── agents ──
+@api.post("/v1/agents")
+async def r_agent_create(req: Request):
+    if (g := _require_leader()): return g
+    picked = _pick_node()
+    if not picked:
+        return JSONResponse(status_code=503, content={"error": "no Ready node with capacity"})
+    node, addr = picked
+    try:
+        r = await _http.post(f"http://{addr}:{NODE_EXEC_PORT}/v1/agents", json=await req.json(), timeout=30)
+    except httpx.HTTPError as e:
+        return JSONResponse(status_code=502, content={"error": f"agent create forwarding failed: {e}"})
+    if r.status_code < 300 and (aid := r.json().get("id")):
+        _agent_home[aid] = node
+    return _json(r)
+
+
+@api.get("/v1/agents")
+async def r_agent_list():
+    if (g := _require_leader()): return g
+    data, seen = [], set()
+    for node, addr, _free in _ready_addrs():
+        try:
+            r = await _http.get(f"http://{addr}:{NODE_EXEC_PORT}/v1/agents", timeout=15)
+            for a in r.json().get("data", []):
+                if a.get("id") not in seen:
+                    seen.add(a.get("id")); data.append(a); _agent_home[a.get("id")] = node
+        except httpx.HTTPError:
+            continue
+    return {"data": data}
+
+
+@api.get("/v1/agents/{agent_id}")
+async def r_agent_get(agent_id: str):
+    if (g := _require_leader()): return g
+    return await _forward_agent(agent_id, "GET", "")
+
+
+@api.post("/v1/agents/{agent_id}")
+async def r_agent_update(agent_id: str, req: Request):
+    if (g := _require_leader()): return g
+    return await _forward_agent(agent_id, "POST", "", body=await req.json())
+
+
+@api.get("/v1/agents/{agent_id}/versions")
+async def r_agent_versions(agent_id: str):
+    if (g := _require_leader()): return g
+    return await _forward_agent(agent_id, "GET", "/versions")
+
+
+@api.post("/v1/agents/{agent_id}/archive")
+async def r_agent_archive(agent_id: str):
+    if (g := _require_leader()): return g
+    return await _forward_agent(agent_id, "POST", "/archive")
+
+
+# ── environments (home-noded, like agents) ──
+@api.post("/v1/environments")
+async def r_env_create(req: Request):
+    if (g := _require_leader()): return g
+    picked = _pick_node()
+    if not picked:
+        return JSONResponse(status_code=503, content={"error": "no Ready node"})
+    node, addr = picked
+    try:
+        r = await _http.post(f"http://{addr}:{NODE_EXEC_PORT}/v1/environments", json=await req.json(), timeout=30)
+    except httpx.HTTPError as e:
+        return JSONResponse(status_code=502, content={"error": f"environment create forwarding failed: {e}"})
+    if r.status_code < 300 and (eid := r.json().get("id")):
+        _env_home[eid] = node
+    return _json(r)
+
+
+@api.get("/v1/environments")
+async def r_env_list():
+    if (g := _require_leader()): return g
+    data, seen = [], set()
+    for node, addr, _free in _ready_addrs():
+        try:
+            r = await _http.get(f"http://{addr}:{NODE_EXEC_PORT}/v1/environments", timeout=15)
+            for e in r.json().get("data", []):
+                if e.get("id") not in seen:
+                    seen.add(e.get("id")); data.append(e); _env_home[e.get("id")] = node
+        except httpx.HTTPError:
+            continue
+    return {"data": data}
+
+
+async def _resolve_env(eid: str):
+    """Return (node, env_record) for an environment, scanning on a cache miss."""
+    node = _env_home.get(eid)
+    addr = _registry.address(node) if node else None
+    if addr:
+        try:
+            r = await _http.get(f"http://{addr}:{NODE_EXEC_PORT}/v1/environments/{eid}", timeout=10)
+            if r.status_code == 200:
+                return node, r.json()
+        except httpx.HTTPError:
+            pass
+    for node, addr, _free in _ready_addrs():
+        try:
+            r = await _http.get(f"http://{addr}:{NODE_EXEC_PORT}/v1/environments/{eid}", timeout=10)
+            if r.status_code == 200:
+                _env_home[eid] = node
+                return node, r.json()
+        except httpx.HTTPError:
+            continue
+    return None, None
+
+
+@api.get("/v1/environments/{eid}")
+async def r_env_get(eid: str):
+    if (g := _require_leader()): return g
+    _node, env = await _resolve_env(eid)
+    if not env:
+        return JSONResponse(status_code=404, content={"error": f"environment '{eid}' not found"})
+    return env
+
+
+@api.delete("/v1/environments/{eid}")
+async def r_env_delete(eid: str):
+    if (g := _require_leader()): return g
+    node, _env = await _resolve_env(eid)
+    if not node:
+        return JSONResponse(status_code=404, content={"error": f"environment '{eid}' not found"})
+    addr = _registry.address(node)
+    try:
+        r = await _http.delete(f"http://{addr}:{NODE_EXEC_PORT}/v1/environments/{eid}", timeout=15)
+    except httpx.HTTPError as e:
+        return JSONResponse(status_code=502, content={"error": f"forwarding failed: {e}"})
+    _env_home.pop(eid, None)
+    return _json(r)
+
+
+# ── sessions ──
+@api.post("/v1/sessions")
+async def r_session_create(req: Request):
+    if (g := _require_leader()): return g
+    body = await req.json()
+    agent_id = body.get("agent_id")
+    if not agent_id:
+        return JSONResponse(status_code=422, content={"error": "agent_id is required"})
+    # Resolve the agent definition on its home node, and the environment if one was named.
+    home = await _resolve_agent_home(agent_id)
+    if not home:
+        return JSONResponse(status_code=404, content={"error": f"agent '{agent_id}' not found"})
+    haddr = _registry.address(home)
+    try:
+        ar = await _http.get(f"http://{haddr}:{NODE_EXEC_PORT}/v1/agents/{agent_id}", timeout=15)
+    except httpx.HTTPError as e:
+        return JSONResponse(status_code=502, content={"error": f"agent lookup failed: {e}"})
+    if ar.status_code != 200:
+        return _json(ar)
+    body["agent"] = ar.json()  # inline definition (carries versions; node picks agent_version)
+    if body.get("environment_id"):
+        _node, env = await _resolve_env(body["environment_id"])
+        if not env:
+            return JSONResponse(status_code=404,
+                                content={"error": f"environment '{body['environment_id']}' not found"})
+        body["environment"] = env
+    # Place the session on any node with capacity (definitions travel inline).
+    picked = _pick_node()
+    if not picked:
+        return JSONResponse(status_code=503, content={"error": "fleet at capacity: no node has a free VM slot"})
+    node, addr = picked
+    try:
+        r = await _http.post(f"http://{addr}:{NODE_EXEC_PORT}/v1/sessions", json=body, timeout=180)
+    except httpx.HTTPError as e:
+        return JSONResponse(status_code=502, content={"error": f"session create forwarding failed: {e}"})
+    if r.status_code < 300 and (sid := r.json().get("id")):
+        try:
+            await _kc.create_session(sid, node, vm_ref=r.json().get("vm_id", ""))
+            _cache.put(sid, node)
+        except Exception as e:
+            log.warning(f"recording agent-session CR {sid} failed: {e}")
+    return _json(r)
+
+
+@api.get("/v1/sessions")
+async def r_session_list():
+    if (g := _require_leader()): return g
+    data = []
+    for node, addr, _free in _ready_addrs():
+        try:
+            r = await _http.get(f"http://{addr}:{NODE_EXEC_PORT}/v1/sessions", timeout=15)
+            data.extend(r.json().get("data", []))
+        except httpx.HTTPError:
+            continue
+    return {"data": data}
+
+
+@api.get("/v1/sessions/{sid}")
+async def r_session_get(sid: str):
+    if (g := _require_leader()): return g
+    return await _forward_session(sid, "GET", "")
+
+
+@api.post("/v1/sessions/{sid}")
+async def r_session_update(sid: str, req: Request):
+    if (g := _require_leader()): return g
+    return await _forward_session(sid, "POST", "", body=await req.json())
+
+
+@api.delete("/v1/sessions/{sid}")
+async def r_session_delete(sid: str):
+    if (g := _require_leader()): return g
+    resp = await _forward_session(sid, "DELETE", "", timeout=60)
+    try:
+        await _kc.delete_session(sid)
+    except Exception as e:
+        log.warning(f"deleting session CR {sid} failed: {e}")
+    _cache.drop(sid)
+    return resp
+
+
+@api.post("/v1/sessions/{sid}/events")
+async def r_session_event(sid: str, req: Request):
+    if (g := _require_leader()): return g
+    return await _forward_session(sid, "POST", "/events", body=await req.json())
+
+
+@api.get("/v1/sessions/{sid}/events")
+async def r_session_events(sid: str):
+    if (g := _require_leader()): return g
+    return await _forward_session(sid, "GET", "/events", timeout=90)
+
+
+@api.get("/v1/sessions/{sid}/usage")
+async def r_session_usage(sid: str):
+    if (g := _require_leader()): return g
+    return await _forward_session(sid, "GET", "/usage", timeout=90)
+
+
+@api.get("/v1/sessions/{sid}/events/stream")
+async def r_session_stream(sid: str, from_offset: int = 0):
+    if (g := _require_leader()): return g
+    node = await _cache.get_node(sid)
+    if not node:
+        return JSONResponse(status_code=404, content={"error": f"session '{sid}' not found"})
+    addr = _registry.address(node)
+    if not addr:
+        return JSONResponse(status_code=503, content={"error": "the node hosting this session is unavailable"})
+    url = f"http://{addr}:{NODE_EXEC_PORT}/v1/sessions/{sid}/events/stream"
+
+    async def gen():
+        try:
+            async with _http.stream("GET", url, params={"from_offset": from_offset}, timeout=None) as resp:
+                async for chunk in resp.aiter_raw():
+                    yield chunk
+        except httpx.HTTPError as e:
+            yield (f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n").encode()
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 # ─── ASGI combiner: /mcp -> FastMCP, everything else -> FastAPI ───────────────────
