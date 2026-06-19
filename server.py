@@ -11,6 +11,8 @@ import json
 import os
 import shutil
 import subprocess
+import secrets
+import tempfile
 import time
 import uuid
 import logging
@@ -62,6 +64,9 @@ NODE_NAME = os.environ.get("NODE_NAME", "")
 # idle VMs cheap). The next bash_exec auto-resumes it. 0 disables.
 IDLE_PAUSE_SECONDS = int(os.environ.get("FC_IDLE_PAUSE_SECONDS", "300"))
 IDLE_CHECK_INTERVAL = int(os.environ.get("FC_IDLE_CHECK_INTERVAL", "30"))
+
+# Guest agent (fc-agent) control-plane HTTP port — replaces SSH for command exec.
+AGENT_HTTP_PORT = int(os.environ.get("FC_AGENT_HTTP_PORT", "2025"))
 
 # Optional S3 archival of paused-VM snapshots, so a paused VM survives node loss and
 # can be restored on a survivor node. Disabled when FC_S3_BUCKET is unset. Credentials
@@ -455,6 +460,43 @@ async def _create_overlay(vm_id: str, size_mb: int):
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     await proc2.communicate()
+    await _write_agent_token(vm_id)
+
+
+async def _write_agent_token(vm_id: str):
+    """Write the VM's per-VM agent bearer token into the overlay at /etc/fc-agent/token
+    (0600) before boot, so fc-agent can authenticate the host. Loop-mounts the overlay
+    (host runs as root); the overlay isn't opened by Firecracker until after this."""
+    token = (_vm_state.get(vm_id) or {}).get("agent_token")
+    if not token:
+        return
+    overlay = _overlay_path(vm_id)
+    mnt = Path(tempfile.mkdtemp(prefix="fc-tok-"))
+    try:
+        m = await asyncio.create_subprocess_exec(
+            "mount", "-o", "loop", str(overlay), str(mnt),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, merr = await m.communicate()
+        if m.returncode != 0:
+            raise RuntimeError(f"token mount failed: {merr.decode(errors='replace')}")
+        try:
+            tok_dir = mnt / "etc" / "fc-agent"
+            tok_dir.mkdir(parents=True, exist_ok=True)
+            tok_path = tok_dir / "token"
+            tok_path.write_text(token)
+            tok_path.chmod(0o600)
+        finally:
+            u = await asyncio.create_subprocess_exec(
+                "umount", str(mnt),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await u.communicate()
+    finally:
+        try:
+            mnt.rmdir()
+        except OSError:
+            pass
 
 
 async def _launch_firecracker(vm_id: str, vcpu: int, mem_mb: int) -> int:
@@ -548,6 +590,50 @@ async def _ssh_exec(vm_id: str, command: str, timeout: int = 60) -> Dict[str, An
         return {"stdout": "", "stderr": "Command timed out", "returncode": -1}
 
 
+async def _wait_for_agent(vm_id: str, timeout: int = 30) -> bool:
+    """Poll the guest agent's /health until it answers 200 or the deadline passes.
+    Replaces _wait_for_ssh — /health is up only once the agent's exec loop is live."""
+    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/health"
+    deadline = time.time() + timeout
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        while time.time() < deadline:
+            try:
+                r = await client.get(url)
+                if r.status_code == 200:
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+    return False
+
+
+async def _agent_exec(vm_id: str, command: str, timeout: int = 60,
+                      working_dir: Optional[str] = None) -> Dict[str, Any]:
+    """Run a command in the VM via the guest agent (HTTP control plane), replacing SSH.
+    Returns the same {stdout, stderr, returncode} contract as _ssh_exec. working_dir is
+    sent to the guest (which sets the child's cwd) rather than prepended as `cd … &&`."""
+    record = _vm_state.get(vm_id) or {}
+    token = record.get("agent_token", "")
+    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/exec"
+    payload: Dict[str, Any] = {"command": command, "timeout_secs": timeout}
+    if working_dir:
+        payload["working_dir"] = working_dir
+    try:
+        async with httpx.AsyncClient(timeout=timeout + 10) as client:
+            r = await client.post(url, json=payload,
+                                  headers={"Authorization": f"Bearer {token}"})
+    except Exception as e:
+        return {"stdout": "", "stderr": f"agent connection failed: {e}", "returncode": -1}
+    if r.status_code != 200:
+        return {"stdout": "", "stderr": f"agent error {r.status_code}: {r.text}", "returncode": -1}
+    data = r.json()
+    return {
+        "stdout": data.get("stdout", ""),
+        "stderr": data.get("stderr", ""),
+        "returncode": data.get("returncode", -1),
+    }
+
+
 async def _allocate_and_create_record(vm_id: str, name: str, vcpu: int, mem_mb: int, disk_mb: int) -> Dict:
     """Atomically allocate a slot and persist a 'creating' record.
 
@@ -567,6 +653,7 @@ async def _allocate_and_create_record(vm_id: str, name: str, vcpu: int, mem_mb: 
             "slot": slot, "ip_address": f"172.16.0.{slot}",
             "created_at": time.time(), "last_activity": time.time(),
             "pid": None, "snapshot": None,
+            "agent_token": secrets.token_urlsafe(32),
         }
         _vm_state.create(vm_id, record)
     return record
@@ -620,7 +707,7 @@ async def _resolve_session_vm(session_id: str) -> str:
                     })
                 finally:
                     await fc.close()
-                await _wait_for_ssh(vm_id, timeout=30)
+                await _wait_for_agent(vm_id, timeout=30)
                 _vm_state.update(vm_id, {"status": "running"})
                 return vm_id
 
@@ -634,8 +721,8 @@ async def _resolve_session_vm(session_id: str) -> str:
         await _create_overlay(new_vm_id, DEFAULT_DISK_MB)
         pid = await _launch_firecracker(new_vm_id, DEFAULT_VCPU, DEFAULT_MEM_MB)
         _vm_state.update(new_vm_id, {"pid": pid, "status": "booting"})
-        if not await _wait_for_ssh(new_vm_id, timeout=45):
-            raise RuntimeError("SSH never became available after VM boot")
+        if not await _wait_for_agent(new_vm_id, timeout=45):
+            raise RuntimeError("agent never became available after VM boot")
         _vm_state.update(new_vm_id, {"status": "running"})
     except Exception as e:
         _vm_state.update(new_vm_id, {"status": "error", "error": str(e)})
@@ -725,6 +812,15 @@ class RestoreInput(BaseModel):
     session_id: Optional[str] = Field(default=None, description="Bind this session to the restored VM")
 
 
+class VmExecInput(BaseModel):
+    """Admin exec against a specific VM (used by fcctl). Unlike /exec, it does no session
+    resolution and never auto-creates/resumes — the VM must already exist and be running."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    command: str = Field(..., min_length=1, max_length=8192)
+    timeout: int = Field(default=60, ge=1, le=600)
+    working_dir: Optional[str] = Field(default=None)
+
+
 # ─── FastMCP (bash_exec only) ──────────────────────────────────────────────────
 
 mcp = FastMCP(
@@ -780,12 +876,8 @@ async def bash_exec(params: BashExecInput, ctx: Context) -> str:
         })
 
     _touch(vm_id)  # mark active so idle-pause won't reap it mid-use
-    command = params.command
-    if params.working_dir:
-        command = f"cd {params.working_dir} && {command}"
-
     start = time.time()
-    result = await _ssh_exec(vm_id, command, timeout=params.timeout)
+    result = await _agent_exec(vm_id, params.command, timeout=params.timeout, working_dir=params.working_dir)
     elapsed = round(time.time() - start, 2)
 
     return json.dumps({
@@ -1034,12 +1126,8 @@ async def api_exec(params: ExecInput):
         return JSONResponse(status_code=409, content={"error": f"VM not running (status: {status})"})
 
     _touch(vm_id)  # mark active so idle-pause won't reap it mid-use
-    command = params.command
-    if params.working_dir:
-        command = f"cd {params.working_dir} && {command}"
-
     start = time.time()
-    result = await _ssh_exec(vm_id, command, timeout=params.timeout)
+    result = await _agent_exec(vm_id, params.command, timeout=params.timeout, working_dir=params.working_dir)
     elapsed = round(time.time() - start, 2)
     return {
         "vm_id": vm_id, "command": params.command,
@@ -1080,10 +1168,10 @@ async def api_vm_create(params: VMCreateInput):
         await _create_overlay(vm_id, params.disk_mb)
         pid = await _launch_firecracker(vm_id, params.vcpu, params.mem_mb)
         _vm_state.update(vm_id, {"pid": pid, "status": "booting"})
-        ready = await _wait_for_ssh(vm_id, timeout=45)
+        ready = await _wait_for_agent(vm_id, timeout=45)
         if not ready:
-            _vm_state.update(vm_id, {"status": "error", "error": "SSH timeout"})
-            raise HTTPException(status_code=500, detail="VM booted but SSH never became available.")
+            _vm_state.update(vm_id, {"status": "error", "error": "agent timeout"})
+            raise HTTPException(status_code=500, detail="VM booted but the agent never became available.")
         _vm_state.update(vm_id, {"status": "running"})
         return {
             "vm_id": vm_id, "name": name, "status": "running",
@@ -1137,6 +1225,29 @@ async def api_vm_status(vm_id: str):
         "pid": record.get("pid"), "created_at": record.get("created_at"),
         "snapshot": snap_info,
         "error": record.get("error"),
+    }
+
+
+@api.post("/vms/{vm_id}/exec", tags=["VMs"], summary="Run a command in a VM (admin)")
+async def api_vm_exec(vm_id: str, params: VmExecInput):
+    """Run a command in a specific running VM, addressed by id (the fcctl control plane).
+
+    Mirrors bash_exec minus session resolution: 404 if the VM is unknown, 409 if it is not
+    running (no auto-create/resume). Admin-only by network position, like the rest of /vms/*.
+    """
+    record = _vm_state.get(vm_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"VM '{vm_id}' not found.")
+    if record["status"] != "running":
+        raise HTTPException(status_code=409, detail=f"VM is not running (status: {record['status']}).")
+    _touch(vm_id)
+    start = time.time()
+    result = await _agent_exec(vm_id, params.command, timeout=params.timeout, working_dir=params.working_dir)
+    return {
+        "vm_id": vm_id, "command": params.command,
+        "stdout": result["stdout"], "stderr": result["stderr"],
+        "returncode": result["returncode"],
+        "elapsed_seconds": round(time.time() - start, 2),
     }
 
 
@@ -1236,11 +1347,11 @@ async def api_vm_resume(vm_id: str):
         })
         await fc.close()
 
-        ready = await _wait_for_ssh(vm_id, timeout=30)
+        ready = await _wait_for_agent(vm_id, timeout=30)
         _vm_state.update(vm_id, {"status": "running", "pid": fc_proc.pid})
 
         return {
-            "vm_id": vm_id, "name": record["name"], "status": "running", "ssh_ready": ready,
+            "vm_id": vm_id, "name": record["name"], "status": "running", "agent_ready": ready,
         }
     except Exception as e:
         _vm_state.update(vm_id, {"status": "error", "error": str(e)})
