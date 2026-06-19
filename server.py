@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import base64
 import secrets
 import tempfile
 import time
@@ -24,7 +25,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field, ConfigDict
@@ -1516,6 +1517,258 @@ async def api_vm_destroy(vm_id: str):
     _session_map.remove(vm_id)
     await _s3_delete_vm(vm_id)  # no-op when S3 disabled; removes the archive otherwise
     return {"vm_id": vm_id, "name": record["name"], "status": "destroyed"}
+
+
+# ─── Agent sessions (Claude Agent SDK in-VM, managed-agents-shaped) ─────────────
+#
+# Agent  = a stored definition {model, system, allowed_tools} (managed-agents Agent).
+# Session = a VM running the in-VM SDK runner from an Agent's definition; driven by
+#           appending user messages to the runner's input file and streaming its events.
+# This rides the existing fc-agent /exec_async reattachable path and _resolve_session_vm.
+
+class _JsonStore:
+    """Tiny JSON-dict persistence (same pattern as VMState) for agents / agent-sessions."""
+    def __init__(self, path: Path):
+        self._path = path
+        try:
+            self._d: Dict[str, Dict] = json.loads(path.read_text())
+        except Exception:
+            self._d = {}
+
+    def _save(self):
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self._d, indent=2))
+        tmp.replace(self._path)
+
+    def get(self, k): return self._d.get(k)
+    def put(self, k, v): self._d[k] = v; self._save()
+    def delete(self, k): self._d.pop(k, None); self._save()
+    def all(self): return list(self._d.values())
+
+
+AGENTS = _JsonStore(BASE_DIR / "agents.json")
+AGENT_SESSIONS = _JsonStore(BASE_DIR / "agent-sessions.json")
+DEFAULT_AGENT_MODEL = os.environ.get("FC_AGENT_MODEL", "claude-sonnet-4-6")
+
+
+async def _agent_exec_async_start(vm_id: str, command: str, timeout: int = 86400) -> str:
+    """Start a long-running command via fc-agent /exec_async and return its exec_id WITHOUT
+    draining (used for the persistent agent runner)."""
+    record = _vm_state.get(vm_id) or {}
+    token = record.get("agent_token", "")
+    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/exec_async"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, json={"command": command, "timeout_secs": timeout},
+                              headers={"Authorization": f"Bearer {token}"})
+    r.raise_for_status()
+    return r.json()["exec_id"]
+
+
+async def _agent_poll(vm_id: str, exec_id: str, out_off: int) -> Dict[str, Any]:
+    record = _vm_state.get(vm_id) or {}
+    token = record.get("agent_token", "")
+    url = f"http://{_vm_ip(vm_id)}:{AGENT_HTTP_PORT}/exec_async/{exec_id}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(url, params={"out": out_off, "err": 0},
+                             headers={"Authorization": f"Bearer {token}"})
+    r.raise_for_status()
+    return r.json()
+
+
+async def _agent_b64write(vm_id: str, path: str, content: str, append: bool = False):
+    """Write/append content to a guest file via base64 (quoting-safe; the value rides the
+    fc-agent exec body, not the visible command). Raises on failure."""
+    b64 = base64.b64encode(content.encode()).decode()
+    parent = path.rsplit("/", 1)[0]
+    redir = ">>" if append else ">"
+    res = await _agent_exec(vm_id, f"mkdir -p {parent} && echo {b64} | base64 -d {redir} {path}")
+    if res.get("returncode") != 0:
+        raise RuntimeError(f"guest write to {path} failed: {res.get('stderr')}")
+
+
+async def _create_agent_session(agent_id: str, title: Optional[str] = None) -> Dict:
+    agent = AGENTS.get(agent_id)
+    if not agent:
+        raise KeyError(f"agent '{agent_id}' not found")
+    sid = "sesn_" + secrets.token_hex(12)
+    vm_id = await _resolve_session_vm(sid)  # boots a VM bound to this session (creds injected at create)
+    cfg: Dict[str, Any] = {"model": agent.get("model") or DEFAULT_AGENT_MODEL}
+    if agent.get("system"):
+        cfg["system"] = agent["system"]
+    if agent.get("allowed_tools"):
+        cfg["allowedTools"] = agent["allowed_tools"]
+    await _agent_b64write(vm_id, "/etc/fc-agent-runner/agent.json", json.dumps(cfg))
+    exec_id = await _agent_exec_async_start(vm_id, f"fc-agent-runner --session {sid}")
+    rec = {"id": sid, "type": "session", "agent_id": agent_id, "agent_snapshot": agent,
+           "vm_id": vm_id, "status": "idle", "runner_exec_id": exec_id,
+           "title": title, "created_at": time.time(), "updated_at": time.time()}
+    AGENT_SESSIONS.put(sid, rec)
+    return rec
+
+
+async def _session_send(sid: str, content: str) -> Dict:
+    rec = AGENT_SESSIONS.get(sid)
+    if not rec:
+        raise KeyError(f"session '{sid}' not found")
+    _touch(rec["vm_id"])  # keep the VM alive while a turn runs
+    await _agent_b64write(rec["vm_id"], f"/var/run/fc-agent-runner/{sid}.in",
+                          json.dumps({"content": content}) + "\n", append=True)
+    rec["status"] = "running"; rec["updated_at"] = time.time()
+    AGENT_SESSIONS.put(sid, rec)
+    return rec
+
+
+async def _stream_session_events(sid: str, from_off: int = 0, max_idle: float = 300.0):
+    """Async-generator of the session runner's stream-json events, drained from fc-agent by
+    byte offset. Buffers partial lines across 1 MiB poll chunks."""
+    rec = AGENT_SESSIONS.get(sid)
+    if not rec:
+        return
+    vm_id, exec_id = rec["vm_id"], rec["runner_exec_id"]
+    out_off, buf, last = from_off, "", time.time()
+    while time.time() - last < max_idle:
+        try:
+            d = await _agent_poll(vm_id, exec_id, out_off)
+        except Exception:
+            await asyncio.sleep(0.4)
+            continue
+        chunk = d.get("stdout", "")
+        out_off = d.get("out_offset", out_off)
+        if chunk:
+            last = time.time()
+            buf += chunk
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                if line.strip():
+                    try:
+                        yield json.loads(line)
+                    except Exception:
+                        pass
+        if d.get("done"):
+            r2 = AGENT_SESSIONS.get(sid)
+            if r2:
+                r2["status"] = "terminated"; AGENT_SESSIONS.put(sid, r2)
+            return
+        await asyncio.sleep(0.3)
+
+
+class AgentCreateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: str = Field(..., min_length=1, max_length=128)
+    model: Optional[str] = None
+    system: Optional[str] = Field(default=None, max_length=20000)
+    allowed_tools: Optional[List[str]] = None
+
+
+class SessionCreateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., min_length=1)
+    title: Optional[str] = Field(default=None, max_length=200)
+
+
+class SessionMessageInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    content: str = Field(..., min_length=1, max_length=100000)
+
+
+class AgentRunInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    agent_id: str = Field(..., min_length=1)
+    prompt: str = Field(..., min_length=1, max_length=100000)
+    timeout: int = Field(default=300, ge=1, le=3600)
+
+
+@api.post("/v1/agents", status_code=201, tags=["Agents"], summary="Create an agent definition")
+async def api_agent_create(params: AgentCreateInput):
+    aid = "agent_" + secrets.token_hex(12)
+    rec = {"id": aid, "type": "agent", "version": 1, "name": params.name,
+           "model": params.model or DEFAULT_AGENT_MODEL, "system": params.system,
+           "allowed_tools": params.allowed_tools,
+           "created_at": time.time(), "updated_at": time.time()}
+    AGENTS.put(aid, rec)
+    return rec
+
+
+@api.get("/v1/agents", tags=["Agents"], summary="List agents")
+async def api_agent_list():
+    return {"data": AGENTS.all()}
+
+
+@api.get("/v1/agents/{agent_id}", tags=["Agents"], summary="Get an agent")
+async def api_agent_get(agent_id: str):
+    a = AGENTS.get(agent_id)
+    if not a:
+        raise HTTPException(status_code=404, detail=f"agent '{agent_id}' not found")
+    return a
+
+
+@api.post("/v1/sessions", status_code=201, tags=["Agent sessions"], summary="Create an agent session (boots a VM running the agent)")
+async def api_session_create(params: SessionCreateInput):
+    try:
+        return await _create_agent_session(params.agent_id, params.title)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"session create failed: {e}")
+
+
+@api.get("/v1/sessions", tags=["Agent sessions"], summary="List agent sessions")
+async def api_session_list():
+    return {"data": AGENT_SESSIONS.all()}
+
+
+@api.get("/v1/sessions/{sid}", tags=["Agent sessions"], summary="Get an agent session")
+async def api_session_get(sid: str):
+    s = AGENT_SESSIONS.get(sid)
+    if not s:
+        raise HTTPException(status_code=404, detail=f"session '{sid}' not found")
+    return s
+
+
+@api.post("/v1/sessions/{sid}/events", tags=["Agent sessions"], summary="Send a user message (drive a turn)")
+async def api_session_event(sid: str, params: SessionMessageInput):
+    try:
+        rec = await _session_send(sid, params.content)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return {"session_id": sid, "status": rec["status"]}
+
+
+@api.get("/v1/sessions/{sid}/events/stream", tags=["Agent sessions"], summary="Stream session events (SSE)")
+async def api_session_stream(sid: str, from_offset: int = 0):
+    if not AGENT_SESSIONS.get(sid):
+        raise HTTPException(status_code=404, detail=f"session '{sid}' not found")
+
+    async def gen():
+        async for ev in _stream_session_events(sid, from_off=from_offset):
+            yield f"data: {json.dumps(ev)}\n\n"
+        yield "event: end\ndata: {}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@mcp.tool(
+    name="agent_run",
+    annotations={"title": "Run a Claude agent in a microVM", "readOnlyHint": False,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+async def agent_run(params: AgentRunInput, ctx: Context) -> str:
+    """Boot a microVM running the Claude Agent SDK from the given agent definition, send one
+    prompt, and return the agent's final result. JSON: {session_id, vm_id, result, events}."""
+    try:
+        rec = await _create_agent_session(params.agent_id, title="agent_run")
+    except KeyError as e:
+        return json.dumps({"error": str(e)})
+    sid = rec["id"]
+    await _session_send(sid, params.prompt)
+    result, n = None, 0
+    async for ev in _stream_session_events(sid, from_off=0, max_idle=params.timeout):
+        n += 1
+        if ev.get("type") == "result":
+            result = ev.get("result")
+            break
+    return json.dumps({"session_id": sid, "vm_id": rec["vm_id"], "result": result, "events": n}, indent=2)
 
 
 # ─── Entry Point ───────────────────────────────────────────────────────────────
