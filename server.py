@@ -1548,6 +1548,7 @@ class _JsonStore:
 
 
 AGENTS = _JsonStore(BASE_DIR / "agents.json")
+ENVIRONMENTS = _JsonStore(BASE_DIR / "environments.json")
 AGENT_SESSIONS = _JsonStore(BASE_DIR / "agent-sessions.json")
 DEFAULT_AGENT_MODEL = os.environ.get("FC_AGENT_MODEL", "claude-sonnet-4-6")
 
@@ -1587,12 +1588,41 @@ async def _agent_b64write(vm_id: str, path: str, content: str, append: bool = Fa
         raise RuntimeError(f"guest write to {path} failed: {res.get('stderr')}")
 
 
-async def _create_agent_session(agent_id: str, title: Optional[str] = None) -> Dict:
+async def _create_and_boot_vm(name: str, vcpu: int, mem_mb: int, disk_mb: int) -> str:
+    """Create + boot a VM with explicit specs (mirrors api_vm_create's inner flow)."""
+    vm_id = str(uuid.uuid4())
+    await _allocate_and_create_record(vm_id, name, vcpu, mem_mb, disk_mb)
+    try:
+        await _create_overlay(vm_id, disk_mb)
+        pid = await _launch_firecracker(vm_id, vcpu, mem_mb)
+        _vm_state.update(vm_id, {"pid": pid, "status": "booting"})
+        if not await _wait_for_agent(vm_id, timeout=45):
+            raise RuntimeError("agent never became available after VM boot")
+        _vm_state.update(vm_id, {"status": "running"})
+    except Exception as e:
+        _vm_state.update(vm_id, {"status": "error", "error": str(e)})
+        raise
+    return vm_id
+
+
+async def _create_agent_session(agent_id: str, title: Optional[str] = None,
+                                environment_id: Optional[str] = None) -> Dict:
     agent = AGENTS.get(agent_id)
     if not agent:
         raise KeyError(f"agent '{agent_id}' not found")
+    env = None
+    if environment_id:
+        env = ENVIRONMENTS.get(environment_id)
+        if not env:
+            raise KeyError(f"environment '{environment_id}' not found")
     sid = "sesn_" + secrets.token_hex(12)
-    vm_id = await _resolve_session_vm(sid)  # boots a VM bound to this session (creds injected at create)
+    vm_id = await _create_and_boot_vm(
+        f"agent-{sid[5:17]}",
+        (env or {}).get("vcpu", DEFAULT_VCPU),
+        (env or {}).get("mem_mb", DEFAULT_MEM_MB),
+        (env or {}).get("disk_mb", DEFAULT_DISK_MB),
+    )
+    _session_map.set(sid, vm_id)  # bind so later turns auto-resume the same VM
     cfg: Dict[str, Any] = {"model": agent.get("model") or DEFAULT_AGENT_MODEL}
     if agent.get("system"):
         cfg["system"] = agent["system"]
@@ -1601,8 +1631,9 @@ async def _create_agent_session(agent_id: str, title: Optional[str] = None) -> D
     await _agent_b64write(vm_id, "/etc/fc-agent-runner/agent.json", json.dumps(cfg))
     exec_id = await _agent_exec_async_start(vm_id, f"fc-agent-runner --session {sid}")
     rec = {"id": sid, "type": "session", "agent_id": agent_id, "agent_snapshot": agent,
-           "vm_id": vm_id, "status": "idle", "runner_exec_id": exec_id,
-           "title": title, "created_at": time.time(), "updated_at": time.time()}
+           "environment_id": environment_id, "vm_id": vm_id, "status": "idle",
+           "runner_exec_id": exec_id, "title": title,
+           "created_at": time.time(), "updated_at": time.time()}
     AGENT_SESSIONS.put(sid, rec)
     return rec
 
@@ -1664,7 +1695,21 @@ class AgentCreateInput(BaseModel):
 class SessionCreateInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_id: str = Field(..., min_length=1)
+    environment_id: Optional[str] = None
     title: Optional[str] = Field(default=None, max_length=200)
+
+
+class SessionUpdateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    title: Optional[str] = Field(default=None, max_length=200)
+
+
+class EnvironmentCreateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: str = Field(..., min_length=1, max_length=128)
+    vcpu: int = Field(default=DEFAULT_VCPU, ge=1, le=8)
+    mem_mb: int = Field(default=DEFAULT_MEM_MB, ge=128, le=8192)
+    disk_mb: int = Field(default=DEFAULT_DISK_MB, ge=512, le=20480)
 
 
 class SessionMessageInput(BaseModel):
@@ -1706,7 +1751,7 @@ async def api_agent_get(agent_id: str):
 @api.post("/v1/sessions", status_code=201, tags=["Agent sessions"], summary="Create an agent session (boots a VM running the agent)")
 async def api_session_create(params: SessionCreateInput):
     try:
-        return await _create_agent_session(params.agent_id, params.title)
+        return await _create_agent_session(params.agent_id, params.title, params.environment_id)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -1746,6 +1791,97 @@ async def api_session_stream(sid: str, from_offset: int = 0):
         yield "event: end\ndata: {}\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+async def _replay_events(sid: str) -> List[Dict]:
+    """Drain all currently-available runner events (from offset 0) and return them parsed."""
+    rec = AGENT_SESSIONS.get(sid)
+    if not rec:
+        return []
+    vm_id, exec_id = rec["vm_id"], rec["runner_exec_id"]
+    out_off, buf, events = 0, "", []
+    for _ in range(60):
+        try:
+            d = await _agent_poll(vm_id, exec_id, out_off)
+        except Exception:
+            break
+        new = d.get("stdout", "")
+        out_off = d.get("out_offset", out_off)
+        buf += new
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            if line.strip():
+                try:
+                    events.append(json.loads(line))
+                except Exception:
+                    pass
+        if d.get("done") or not new:
+            break
+    return events
+
+
+@api.post("/v1/environments", status_code=201, tags=["Environments"], summary="Create an environment (VM spec)")
+async def api_env_create(params: EnvironmentCreateInput):
+    eid = "env_" + secrets.token_hex(12)
+    rec = {"id": eid, "type": "environment", "name": params.name, "vcpu": params.vcpu,
+           "mem_mb": params.mem_mb, "disk_mb": params.disk_mb, "created_at": time.time()}
+    ENVIRONMENTS.put(eid, rec)
+    return rec
+
+
+@api.get("/v1/environments", tags=["Environments"], summary="List environments")
+async def api_env_list():
+    return {"data": ENVIRONMENTS.all()}
+
+
+@api.get("/v1/environments/{eid}", tags=["Environments"], summary="Get an environment")
+async def api_env_get(eid: str):
+    e = ENVIRONMENTS.get(eid)
+    if not e:
+        raise HTTPException(status_code=404, detail=f"environment '{eid}' not found")
+    return e
+
+
+@api.delete("/v1/environments/{eid}", tags=["Environments"], summary="Delete an environment")
+async def api_env_delete(eid: str):
+    if not ENVIRONMENTS.get(eid):
+        raise HTTPException(status_code=404, detail=f"environment '{eid}' not found")
+    ENVIRONMENTS.delete(eid)
+    return {"id": eid, "deleted": True}
+
+
+@api.post("/v1/sessions/{sid}", tags=["Agent sessions"], summary="Update a session (title)")
+async def api_session_update(sid: str, params: SessionUpdateInput):
+    rec = AGENT_SESSIONS.get(sid)
+    if not rec:
+        raise HTTPException(status_code=404, detail=f"session '{sid}' not found")
+    if params.title is not None:
+        rec["title"] = params.title
+    rec["updated_at"] = time.time()
+    AGENT_SESSIONS.put(sid, rec)
+    return rec
+
+
+@api.delete("/v1/sessions/{sid}", tags=["Agent sessions"], summary="Terminate a session (destroy its VM)")
+async def api_session_delete(sid: str):
+    rec = AGENT_SESSIONS.get(sid)
+    if not rec:
+        raise HTTPException(status_code=404, detail=f"session '{sid}' not found")
+    try:
+        await api_vm_destroy(rec["vm_id"])
+    except Exception as e:
+        log.warning(f"session {sid} VM destroy failed: {e}")
+    rec["status"] = "terminated"
+    rec["updated_at"] = time.time()
+    AGENT_SESSIONS.put(sid, rec)
+    return {"session_id": sid, "status": "terminated"}
+
+
+@api.get("/v1/sessions/{sid}/events", tags=["Agent sessions"], summary="Replay session events")
+async def api_session_events(sid: str):
+    if not AGENT_SESSIONS.get(sid):
+        raise HTTPException(status_code=404, detail=f"session '{sid}' not found")
+    return {"data": await _replay_events(sid)}
 
 
 @mcp.tool(
