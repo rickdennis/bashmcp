@@ -80,15 +80,15 @@ spec:
               value: "32"            # must match the tap count in setup-network.sh
             - name: FC_IDLE_PAUSE_SECONDS
               value: "300"           # snapshot+pause VMs idle >5min (frees RAM/CPU); next exec auto-resumes
-            # Optional: archive paused-VM snapshots to S3 so they survive node loss (recover via
-            # /restore). Unset = disabled. Creds via boto3 default chain (EC2 instance role through
-            # IMDS here since hostNetwork; IRSA on EKS — see rbac.yaml). Needs s3:Get/Put/Delete/List.
-            # - name: FC_S3_BUCKET
-            #   value: "my-fc-mcp-snapshots"
-            # - name: FC_S3_PREFIX
-            #   value: "fc-mcp/snapshots"
-            # - name: AWS_REGION
-            #   value: "us-east-1"
+            # Archive paused-VM snapshots to S3 so they survive node loss (recover via /restore).
+            # Unset = disabled. Creds via boto3 default chain (EC2 instance role through IMDS here
+            # since hostNetwork; IRSA on EKS — see rbac.yaml). Needs s3:Get/Put/Delete/List.
+            - name: FC_S3_BUCKET
+              value: "fc-agent-sandbox-testing-558885799623"
+            - name: FC_S3_PREFIX
+              value: "fc-mcp/snapshots"
+            - name: AWS_REGION
+              value: "us-east-1"
           securityContext:
             privileged: true         # KVM + tap devices
           lifecycle:
