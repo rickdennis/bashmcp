@@ -152,9 +152,23 @@ Interactive docs at `http://<host>:8080/docs`
 | `POST` | `/vms` | Create VM — allocates a slot, copies base rootfs → overlay, launches FC, waits for SSH (45s) |
 | `GET` | `/vms` | List all VMs from in-memory state |
 | `GET` | `/vms/{vm_id}` | VM status + current snapshot info (single snapshot, not a history) |
+| `POST` | `/vms/{vm_id}/exec` | **Admin (fcctl).** `{command, working_dir?, timeout?}` → run a command in a *specific* VM. No session resolution / no auto-create; a paused VM is auto-resumed first: 404 if unknown, 409 if otherwise not running |
 | `POST` | `/vms/{vm_id}/pause` | Freeze VM, write snapshot, kill FC process |
 | `POST` | `/vms/{vm_id}/resume` | Start fresh FC, load the VM's snapshot (no request body) |
 | `DELETE` | `/vms/{vm_id}` | SIGKILL + delete overlay, snapshots, socket, release slot, state entry, session mapping |
+
+## Admin CLI (`fcctl`)
+
+`fcctl/` is a Go (cobra) admin/control-plane CLI for the HA cluster — the durable replacement for `fc-top.py` and `cleanup_fresh.py`. It is **not** the data plane: clients still talk MCP to the router; `fcctl` is for operators. It reaches the cluster two ways, mirroring `fc-top.py`: **CRs via `kubectl`** (`nodeagents`/`sessions`/the router `lease`, always with an explicit `--kubeconfig`) and **per-VM ops via direct REST to each node-agent's `podIP:8080`** (no router dependency). Commands: `ls vms|sessions|nodes`, `get vm|session|node`, `create`, `exec <id> -- <cmd>`, `pause`, `resume`, `restore`, `destroy`, `drain <node>`, `reset`, and `top` (a `bubbletea` dashboard that subsumes `fc-top.py`). `exec` is what `POST /vms/{vm_id}/exec` exists for. `destroy`/`reset`/`drain` confirm interactively unless `-y`. Read commands take `-o json`.
+
+```bash
+cd fcctl && make linux           # static linux/amd64 binary -> ../bin/fcctl
+scp ../bin/fcctl <host>:~/fcctl   # cluster hosts are linux/amd64
+# On a host with kubectl + kubeconfig + reachability to node podIPs:
+fcctl ls nodes && fcctl create --name demo && fcctl exec <id> -- uname -a
+```
+
+Tests are pure Go (`cd fcctl && go test ./...`): CR/`/vms` parsing, the `vm_id→node` index, node selection, render golden strings, and an `httptest` fake node-agent for the REST client + bulk reset. **Gotcha:** when you rebuild the node-agent image, the StatefulSet's `OnDelete` strategy means existing pods keep the *old* code — `kubectl delete pod fc-node-agent-N` to roll each onto the new image before exercising the new endpoint.
 
 ## Kubernetes
 

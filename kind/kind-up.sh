@@ -96,7 +96,22 @@ kubectl apply -f "$REPO_DIR/kubernetes/"
 kubectl -n "$NS" scale statefulset/fc-node-agent --replicas="$WORKERS"
 
 log "6/8  wait for rollouts"
-kubectl -n "$NS" rollout status statefulset/fc-node-agent --timeout=360s
+# The node-agent StatefulSet uses OnDelete (not RollingUpdate), so `kubectl rollout
+# status` errors on it ("only available for RollingUpdate strategy type") and would
+# abort under `set -e`. Poll readyReplicas instead. The router IS a Deployment, so
+# its rollout status works normally.
+echo "waiting for $WORKERS node-agent pod(s) to be Ready ..."
+for _ in $(seq 1 72); do
+  ready=$(kubectl -n "$NS" get statefulset/fc-node-agent -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+  [[ "${ready:-0}" -ge "$WORKERS" ]] && break
+  sleep 5
+done
+ready=$(kubectl -n "$NS" get statefulset/fc-node-agent -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+echo "node-agent readyReplicas=${ready:-0}/$WORKERS"
+[[ "${ready:-0}" -ge "$WORKERS" ]] || die "node-agents did not become Ready (see: kubectl -n $NS get pods)"
+# NOTE: OnDelete means a rebuilt image does NOT roll existing pods. After re-running
+# with code changes, `kubectl -n $NS delete pod fc-node-agent-N` to pick up the new
+# image (destroys that pod's VMs — fine for dev).
 kubectl -n "$NS" rollout status deploy/fc-mcp-router --timeout=180s
 
 log "7/8  cluster state"
