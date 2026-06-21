@@ -2,14 +2,14 @@
 # remote-smoke.sh — run FROM your Mac. Syncs this repo to the Firecracker host,
 # runs host setup, starts the node-agent, and smoke-tests a real microVM end to end.
 #
-#   bash remote-smoke.sh [user@host]
+#   bash scripts/remote-smoke.sh [user@host]
 #
 # Default host is the fc-agent sandbox. Idempotent — safe to re-run.
 set -euo pipefail
 
 HOST="${1:-ec2-user@fc-agent-sandbox.stoneridgeam-dev.cloud}"
 FC_BASE_DIR="/opt/fc-mcp"
-SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/"   # repo root (this script lives in scripts/)
 
 say() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
@@ -18,10 +18,10 @@ rsync -az --exclude '.venv' --exclude 'data' --exclude '__pycache__' --exclude '
     "$SRC" "$HOST:bashmcp/"
 
 say "2/6  host setup (idempotent; first run builds kernel + rootfs, ~5-10 min)"
-ssh "$HOST" "cd ~/bashmcp && sudo FC_BASE_DIR=$FC_BASE_DIR bash setup-firecracker-al2.sh"
+ssh "$HOST" "cd ~/bashmcp && sudo FC_BASE_DIR=$FC_BASE_DIR bash scripts/setup-firecracker-al2.sh"
 
 say "3/6  start node-agent (detached)"
-ssh "$HOST" "cd ~/bashmcp && sudo FC_BASE_DIR=$FC_BASE_DIR bash start-detached.sh"
+ssh "$HOST" "cd ~/bashmcp && sudo FC_BASE_DIR=$FC_BASE_DIR bash scripts/start-detached.sh"
 
 say "4/6  wait for readiness (up to 60s)"
 ssh "$HOST" 'for i in $(seq 1 30); do

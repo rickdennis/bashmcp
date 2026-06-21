@@ -16,7 +16,7 @@ A combined **FastAPI + FastMCP server** (`server.py`). VM lifecycle (create/list
 
 ## Linux Host Setup (One-Time)
 
-**Fastest path:** `sudo FC_BASE_DIR=/opt/fc-mcp bash setup-firecracker.sh` runs all six steps below idempotently (deps → uv → Firecracker → `uv sync` → build images → networking). The manual steps are below for reference.
+**Fastest path:** `sudo FC_BASE_DIR=/opt/fc-mcp bash scripts/setup-firecracker.sh` runs all six steps below idempotently (deps → uv → Firecracker → `uv sync` → build images → networking). The manual steps are below for reference. (All operational shell scripts live in `scripts/`.)
 
 ```bash
 # 1. Install uv
@@ -38,11 +38,11 @@ git clone <repo> && cd bashmcp
 uv sync
 
 # 5. Build VM images (must do in order, ~5-10 min total)
-sudo FC_BASE_DIR=/opt/fc-mcp bash build-kernel.sh    # downloads pre-built kernel (~200MB)
-sudo FC_BASE_DIR=/opt/fc-mcp bash build-rootfs.sh    # bootstraps Ubuntu 22.04 rootfs
+sudo FC_BASE_DIR=/opt/fc-mcp bash scripts/build-kernel.sh    # downloads pre-built kernel (~200MB)
+sudo FC_BASE_DIR=/opt/fc-mcp bash scripts/build-rootfs.sh    # bootstraps Ubuntu 22.04 rootfs
 
 # 6. Set up host networking (bridge + NAT for VMs)
-sudo bash setup-network.sh
+sudo bash scripts/setup-network.sh
 ```
 
 ## Running the Server
@@ -55,7 +55,7 @@ FC_BASE_DIR=./data uv run python server.py --port 8080
 sudo FC_BASE_DIR=/opt/fc-mcp uv run python server.py --port 8080
 
 # Via start script (does preflight checks first)
-sudo FC_BASE_DIR=/opt/fc-mcp bash start.sh
+sudo FC_BASE_DIR=/opt/fc-mcp bash scripts/start.sh
 
 # Docker (requires --privileged and /dev/kvm)
 docker build -t fc-bash-mcp .

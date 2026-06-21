@@ -36,7 +36,8 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
-COPY server.py start.sh setup-network.sh ./
+COPY server.py ./
+COPY scripts/start.sh scripts/setup-network.sh ./
 COPY proxy/ ./proxy/
 RUN chmod +x start.sh setup-network.sh
 

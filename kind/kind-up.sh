@@ -21,7 +21,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 [[ "$(id -u)" -eq 0 ]] || die "run as root: sudo bash kind/kind-up.sh"
 [[ -e /dev/kvm ]]      || die "/dev/kvm not found on host"
-command -v docker >/dev/null || die "docker required (run setup-firecracker-al2.sh first)"
+command -v docker >/dev/null || die "docker required (run scripts/setup-firecracker-al2.sh first)"
 
 # kind multi-node commonly fails to join workers when inotify is exhausted
 # (kubelet can't register; "error uploading crisocket"). Raise the limits.
@@ -80,7 +80,7 @@ log "4b/8 seed kernel/rootfs + SSH key onto workers (/opt/fc-seed)"
 # + base rootfs + matching private key from the node's /opt/fc-seed (hostPath).
 # All kind nodes are on this one host, which already built these under FC_BASE_DIR.
 SEED_DIR="${FC_BASE_DIR:-/opt/fc-mcp}"
-[[ -f "$SEED_DIR/vm-images/vmlinux-5.10" ]] || die "missing $SEED_DIR/vm-images — run setup-firecracker-al2.sh first"
+[[ -f "$SEED_DIR/vm-images/vmlinux-5.10" ]] || die "missing $SEED_DIR/vm-images — run scripts/setup-firecracker-al2.sh first"
 [[ -f "$SEED_DIR/vm_ssh_key" ]]            || die "missing $SEED_DIR/vm_ssh_key"
 for n in $(kind get nodes --name "$CLUSTER" | grep -- '-worker'); do
   docker exec "$n" mkdir -p /opt/fc-seed

@@ -5,7 +5,7 @@
 # debootstrap on AL2), uv installed system-wide so root/sudo can run it, and the
 # SSH key generated BEFORE the rootfs build so its pubkey is baked into the image.
 #
-# Run as root:  sudo FC_BASE_DIR=/opt/fc-mcp bash setup-firecracker-al2.sh
+# Run as root:  sudo FC_BASE_DIR=/opt/fc-mcp bash scripts/setup-firecracker-al2.sh
 set -euo pipefail
 
 FC_VERSION="${FC_VERSION:-v1.10.1}"
@@ -23,7 +23,7 @@ skip() { echo "    (skip) $*"; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
 [[ "$(uname -s)" == "Linux" ]] || die "Firecracker requires Linux."
-[[ "$(id -u)" -eq 0 ]]        || die "Run as root: sudo bash setup-firecracker-al2.sh"
+[[ "$(id -u)" -eq 0 ]]        || die "Run as root: sudo bash scripts/setup-firecracker-al2.sh"
 [[ -e /dev/kvm ]]             || die "/dev/kvm not found."
 
 log "Amazon Linux 2 setup  (FC_VERSION=$FC_VERSION  ARCH=$ARCH  FC_BASE_DIR=$FC_BASE_DIR)"
@@ -71,7 +71,7 @@ fi
 
 # 6. Python deps + kernel + rootfs
 log "[6/7] uv sync + kernel + rootfs"
-(cd "$SCRIPT_DIR" && uv sync)
+(cd "$SCRIPT_DIR/.." && uv sync)   # pyproject.toml is at the repo root (scripts/ is one level down)
 KERNEL="$FC_BASE_DIR/vm-images/vmlinux-5.10"
 ROOTFS="$FC_BASE_DIR/vm-images/ubuntu-22.04-base.ext4"
 if [[ -f "$KERNEL" ]]; then skip "kernel exists"; else FC_BASE_DIR="$FC_BASE_DIR" bash "$SCRIPT_DIR/build-kernel.sh"; fi
@@ -85,4 +85,4 @@ ok "network configured"
 
 echo ""
 echo "Setup complete. Start the node-agent:"
-echo "  sudo FC_BASE_DIR=$FC_BASE_DIR bash start.sh"
+echo "  sudo FC_BASE_DIR=$FC_BASE_DIR bash scripts/start.sh"

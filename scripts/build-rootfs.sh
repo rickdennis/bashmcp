@@ -6,6 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"   # scripts/ lives under the repo root
 BASE_DIR="${FC_BASE_DIR:-/opt/fc-mcp}"
 IMAGES_DIR="$BASE_DIR/vm-images"
 ROOTFS="$IMAGES_DIR/ubuntu-22.04-base.ext4"
@@ -51,9 +52,9 @@ EOF
 
 # ── fc-agent guest agent (HTTP command exec; replaces SSH) ────────────────────
 # The host drives commands into the VM via this agent over the tap instead of SSH.
-# Build it first with: bash build-agent.sh (produces the per-arch binaries in bin/).
+# Build it first with: bash scripts/build-agent.sh (produces the per-arch binaries in bin/).
 _fc_arch="$(case "$(uname -m)" in aarch64|arm64) echo arm64;; *) echo amd64;; esac)"
-FC_AGENT_BIN="${FC_AGENT_BIN:-$SCRIPT_DIR/bin/fc-agent-$_fc_arch}"
+FC_AGENT_BIN="${FC_AGENT_BIN:-$REPO_DIR/bin/fc-agent-$_fc_arch}"
 if [[ -f "$FC_AGENT_BIN" ]]; then
     echo "==> Installing fc-agent guest agent..."
     install -D -m 0755 "$FC_AGENT_BIN" "$MOUNT_DIR/usr/local/bin/fc-agent"
@@ -75,7 +76,7 @@ EOF
         ln -sf /etc/systemd/system/fc-agent.service \
             "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/fc-agent.service"
 else
-    echo "WARNING: fc-agent not found at $FC_AGENT_BIN — run 'bash build-agent.sh' first; rootfs will lack the agent."
+    echo "WARNING: fc-agent not found at $FC_AGENT_BIN — run 'bash scripts/build-agent.sh' first; rootfs will lack the agent."
 fi
 
 # Disable unnecessary services for faster boot

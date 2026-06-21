@@ -9,13 +9,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"   # scripts/ lives under the repo root
 BASE_DIR="${FC_BASE_DIR:-/opt/fc-mcp}"
 IMAGES_DIR="$BASE_DIR/vm-images"
 ROOTFS="$IMAGES_DIR/ubuntu-22.04-base.ext4"
 ROOTFS_SIZE_MB="${ROOTFS_SIZE_MB:-4096}"   # larger base: Node + Claude Agent SDK add ~400MB
 PUBKEY="$BASE_DIR/vm_ssh_key.pub"
 _fc_arch="$(case "$(uname -m)" in aarch64|arm64) echo arm64;; *) echo amd64;; esac)"
-FC_AGENT_BIN="${FC_AGENT_BIN:-$SCRIPT_DIR/bin/fc-agent-$_fc_arch}"   # built by build-agent.sh
+FC_AGENT_BIN="${FC_AGENT_BIN:-$REPO_DIR/bin/fc-agent-$_fc_arch}"   # built by build-agent.sh
 
 command -v docker >/dev/null || { echo "ERROR: docker is required"; exit 1; }
 
@@ -40,7 +41,7 @@ RUN mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d \
 DOCKER
 
 # Bake in the fc-agent guest agent (HTTP command exec; replaces SSH). Build it first
-# with: bash build-agent.sh (produces the per-arch binaries in bin/).
+# with: bash scripts/build-agent.sh (produces the per-arch binaries in bin/).
 if [[ -f "$FC_AGENT_BIN" ]]; then
     echo "==> including fc-agent in the image"
     cp "$FC_AGENT_BIN" "$BUILD/fc-agent"
@@ -52,7 +53,7 @@ RUN chmod 0755 /usr/local/bin/fc-agent \
  && ln -sf /etc/systemd/system/fc-agent.service /etc/systemd/system/multi-user.target.wants/fc-agent.service
 DOCKER2
 else
-    echo "WARNING: fc-agent not found at $FC_AGENT_BIN — run 'bash build-agent.sh' first; rootfs will lack the agent."
+    echo "WARNING: fc-agent not found at $FC_AGENT_BIN — run 'bash scripts/build-agent.sh' first; rootfs will lack the agent."
 fi
 
 # Bake in the Claude Agent SDK runtime (Node 20 + @anthropic-ai/claude-agent-sdk, which bundles
@@ -60,8 +61,8 @@ fi
 # FC_BAKE_AGENT_RUNTIME (default on). Requires build-time network (NodeSource + npm).
 if [[ "${FC_BAKE_AGENT_RUNTIME:-1}" != "0" ]]; then
     echo "==> including Node + Claude Agent SDK runner in the image"
-    cp "$SCRIPT_DIR/agent-runner/runner.mjs"      "$BUILD/runner.mjs"
-    cp "$SCRIPT_DIR/agent-runner/fc-agent-runner"  "$BUILD/fc-agent-runner"
+    cp "$REPO_DIR/agent-runner/runner.mjs"      "$BUILD/runner.mjs"
+    cp "$REPO_DIR/agent-runner/fc-agent-runner"  "$BUILD/fc-agent-runner"
     cat >> "$BUILD/Dockerfile" <<'DOCKER3'
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
  && apt-get install -y --no-install-recommends nodejs \

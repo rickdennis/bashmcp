@@ -86,8 +86,10 @@ Only one tool is exposed over MCP. VM lifecycle is handled by the REST API (belo
 One idempotent script does everything — installs deps, `uv`, Firecracker, runs `uv sync`, builds the kernel + rootfs, and configures host networking:
 
 ```bash
-sudo FC_BASE_DIR=/opt/fc-mcp bash setup-firecracker.sh
+sudo FC_BASE_DIR=/opt/fc-mcp bash scripts/setup-firecracker.sh
 ```
+
+> All operational shell scripts live in `scripts/`.
 
 ### Manual setup
 
@@ -102,16 +104,16 @@ sudo FC_BASE_DIR=/opt/fc-mcp bash setup-firecracker.sh
 
 ```bash
 # Download the pre-built Firecracker kernel (~5.10.225)
-sudo FC_BASE_DIR=/opt/fc-mcp bash build-kernel.sh
+sudo FC_BASE_DIR=/opt/fc-mcp bash scripts/build-kernel.sh
 
 # Build the Ubuntu 22.04 rootfs (~5 minutes)
-sudo FC_BASE_DIR=/opt/fc-mcp bash build-rootfs.sh
+sudo FC_BASE_DIR=/opt/fc-mcp bash scripts/build-rootfs.sh
 ```
 
 #### 2. Set up host networking (bridge + NAT)
 
 ```bash
-sudo bash setup-network.sh
+sudo bash scripts/setup-network.sh
 ```
 
 #### 3. Install Python dependencies
@@ -124,7 +126,7 @@ uv sync
 
 ```bash
 # Via the start script (generates the SSH key + runs preflight checks)
-sudo FC_BASE_DIR=/opt/fc-mcp bash start.sh
+sudo FC_BASE_DIR=/opt/fc-mcp bash scripts/start.sh
 
 # Or directly
 sudo FC_BASE_DIR=/opt/fc-mcp uv run python server.py --port 8080

@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # start-detached.sh — start the node-agent server detached (run ON the host, as root).
-#   sudo FC_BASE_DIR=/opt/fc-mcp bash start-detached.sh
+#   sudo FC_BASE_DIR=/opt/fc-mcp bash scripts/start-detached.sh
 # Kills any prior server, then launches a fresh one under setsid with redirected
 # FDs so it survives the SSH session. Log: /tmp/fcmcp.log
 set -euo pipefail
-cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# cd to the repo root that holds server.py: this script's own dir (image: flat /app) or its
+# parent (repo: scripts/ -> root).
+_d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$_d/server.py" ]] || _d="$(cd "$_d/.." && pwd)"
+cd "$_d"
 
 FC_BASE_DIR="${FC_BASE_DIR:-/opt/fc-mcp}"
 MCP_PORT="${MCP_PORT:-8080}"

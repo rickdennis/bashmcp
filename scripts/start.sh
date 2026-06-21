@@ -66,4 +66,10 @@ echo "    Base dir: $BASE_DIR"
 echo ""
 
 export FC_BASE_DIR="$BASE_DIR"
-exec uv run python "$(dirname "$0")/server.py" --host "$MCP_HOST" --port "$MCP_PORT"
+# Resolve the repo root that holds server.py + pyproject.toml. It's either this script's own
+# dir (the Docker image copies everything flat into /app) or its parent (the repo, where this
+# script lives under scripts/). Run uv from there so it finds pyproject.toml.
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$ROOT_DIR/server.py" ]] || ROOT_DIR="$(cd "$ROOT_DIR/.." && pwd)"
+cd "$ROOT_DIR"
+exec uv run python server.py --host "$MCP_HOST" --port "$MCP_PORT"
