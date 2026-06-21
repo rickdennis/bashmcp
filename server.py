@@ -475,6 +475,48 @@ async def _create_overlay(vm_id: str, size_mb: int):
     await proc2.communicate()
     await _write_agent_token(vm_id)
     await _write_runner_creds(vm_id)
+    await _write_egress_ca(vm_id)
+
+
+async def _write_egress_ca(vm_id: str):
+    """Install the egress CA's PUBLIC cert into the VM's trust store so the guest trusts the
+    MITM proxy's per-SNI leaves. Mirrors _write_agent_token: loop-mount the overlay pre-boot and
+    drop the cert under the system anchors dir (a boot-time `update-ca-certificates` oneshot in
+    the rootfs registers it). The CA private key never enters a VM. No-op when egress is disabled
+    or the cert is absent."""
+    if not FC_EGRESS_ENABLED:
+        return
+    ca_crt = FC_EGRESS_CA_DIR / "ca.crt"
+    if not ca_crt.exists():
+        log.warning("FC_EGRESS_ENABLED but %s missing; skipping egress CA install for %s", ca_crt, vm_id)
+        return
+    overlay = _overlay_path(vm_id)
+    mnt = Path(tempfile.mkdtemp(prefix="fc-egca-"))
+    try:
+        m = await asyncio.create_subprocess_exec(
+            "mount", "-o", "loop", str(overlay), str(mnt),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, merr = await m.communicate()
+        if m.returncode != 0:
+            raise RuntimeError(f"egress-ca mount failed: {merr.decode(errors='replace')}")
+        try:
+            anchors = mnt / "usr" / "local" / "share" / "ca-certificates"
+            anchors.mkdir(parents=True, exist_ok=True)
+            dst = anchors / "fc-egress.crt"
+            dst.write_bytes(ca_crt.read_bytes())
+            dst.chmod(0o644)
+        finally:
+            u = await asyncio.create_subprocess_exec(
+                "umount", str(mnt),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await u.communicate()
+    finally:
+        try:
+            mnt.rmdir()
+        except OSError:
+            pass
 
 
 async def _write_agent_token(vm_id: str):
@@ -1518,6 +1560,7 @@ async def api_vm_destroy(vm_id: str):
     _vm_state.delete(vm_id)
     _session_map.remove(vm_id)
     await _s3_delete_vm(vm_id)  # no-op when S3 disabled; removes the archive otherwise
+    _rebuild_egress_index()  # drop this VM's ip->policy entry so a reused slot can't inherit it
     return {"vm_id": vm_id, "name": record["name"], "status": "destroyed"}
 
 
@@ -1560,6 +1603,8 @@ DEFAULT_AGENT_MODEL = os.environ.get("FC_AGENT_MODEL", "claude-sonnet-4-6")
 # runtime: we denormalize a {vm-ip: egress_policy} map to this file on the shared PV and the
 # proxy mmaps/polls it (see egress/policy.go). Gated by FC_EGRESS_ENABLED.
 EGRESS_INDEX_PATH = BASE_DIR / "egress-index.json"
+FC_EGRESS_ENABLED = os.environ.get("FC_EGRESS_ENABLED", "").lower() not in ("", "0", "false", "no")
+FC_EGRESS_CA_DIR = Path(os.environ.get("FC_EGRESS_CA_DIR", str(BASE_DIR / "egress-ca")))
 
 
 def _repo_slug(repository_url: str) -> str:
@@ -1756,13 +1801,17 @@ async def _provision_resources(vm_id: str, resources: List[Dict]) -> List[Dict]:
             if repo_name.endswith(".git"):
                 repo_name = repo_name[:-4]
             target = r.get("target_dir") or f"/workspace/{repo_name}"
-            token = r.get("authorization_token")
+            # With the egress broker on, the VM holds NO secret: clone tokenlessly and let
+            # fc-egress inject a repo-scoped token after the request leaves the VM. Otherwise
+            # fall back to the legacy short-lived .git-credentials file (written, used, shredded).
+            token = None if FC_EGRESS_ENABLED else r.get("authorization_token")
             branch_arg = f"-b {shlex.quote(r['branch'])} " if r.get("branch") else ""
             if token:
                 host = urlparse(url).hostname or "github.com"
                 await _agent_b64write(vm_id, "/root/.git-credentials",
                                       f"https://x-access-token:{token}@{host}\n")
-            clone = (f"mkdir -p /workspace && HOME=/root git -c credential.helper=store "
+            clone = (f"mkdir -p /workspace && GIT_TERMINAL_PROMPT=0 HOME=/root "
+                     f"git -c credential.helper=store "
                      f"clone --depth 1 {branch_arg}{shlex.quote(url)} {shlex.quote(target)}")
             cmd = clone + ("; rc=$?; shred -u /root/.git-credentials 2>/dev/null || "
                            "rm -f /root/.git-credentials; exit $rc" if token else "")
@@ -1827,7 +1876,8 @@ async def _create_agent_session(agent_id: Optional[str] = None, title: Optional[
                                 agent_version: Optional[int] = None,
                                 resources: Optional[List[Dict]] = None,
                                 agent: Optional[Dict] = None,
-                                environment: Optional[Dict] = None) -> Dict:
+                                environment: Optional[Dict] = None,
+                                egress_policy: Optional[Dict] = None) -> Dict:
     # agent/environment may be passed inline by the router (HA); otherwise resolved locally.
     agent = agent or (AGENTS.get(agent_id) if agent_id else None)
     if not agent:
@@ -1851,6 +1901,17 @@ async def _create_agent_session(agent_id: Optional[str] = None, title: Optional[
         (env or {}).get("disk_mb", DEFAULT_DISK_MB),
     )
     _session_map.set(sid, vm_id)  # bind so later turns auto-resume the same VM
+    policy = _derive_egress_policy(sid, resources, egress_policy)
+    rec = {"id": sid, "type": "session", "agent_id": agent_id,
+           "agent_version": snap.get("version"), "agent_snapshot": snap,
+           "environment_id": environment_id, "vm_id": vm_id, "status": "provisioning",
+           "title": title, "resources": [], "egress_policy": policy,
+           "usage": _zero_usage(), "events_offset": 0,
+           "created_at": time.time(), "updated_at": time.time()}
+    # Persist the policy + VM binding and publish the egress index BEFORE provisioning, so the
+    # broker can resolve this VM's policy when the (secretless) clone runs.
+    AGENT_SESSIONS.put(sid, rec)
+    _rebuild_egress_index()
     cfg: Dict[str, Any] = {"model": snap.get("model") or DEFAULT_AGENT_MODEL}
     if snap.get("system"):
         cfg["system"] = snap["system"]
@@ -1860,12 +1921,9 @@ async def _create_agent_session(agent_id: Optional[str] = None, title: Optional[
     await _agent_b64write(vm_id, "/etc/fc-agent-runner/agent.json", json.dumps(cfg))
     provisioned = await _provision_resources(vm_id, resources or [])  # clone repos / drop files first
     await _agent_runner_start(vm_id, sid)  # typed /agent/start; events keyed by sid
-    rec = {"id": sid, "type": "session", "agent_id": agent_id,
-           "agent_version": snap.get("version"), "agent_snapshot": snap,
-           "environment_id": environment_id, "vm_id": vm_id, "status": "idle",
-           "title": title, "resources": provisioned,
-           "usage": _zero_usage(), "events_offset": 0,
-           "created_at": time.time(), "updated_at": time.time()}
+    rec["resources"] = provisioned
+    rec["status"] = "idle"
+    rec["updated_at"] = time.time()
     AGENT_SESSIONS.put(sid, rec)
     return rec
 
@@ -2000,6 +2058,19 @@ class FileResource(BaseModel):
 ResourceInput = Annotated[Union[GithubRepoResource, FileResource], Field(discriminator="type")]
 
 
+class GitHubEgressInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    repos: List[str] = Field(default_factory=list, max_length=200)  # "owner/repo" or "owner/*"
+
+
+class EgressPolicyInput(BaseModel):
+    """Per-session egress allowances. Merged over what's derived from github_repository
+    resources; enforced by the fc-egress broker (the VM itself holds no credentials)."""
+    model_config = ConfigDict(extra="forbid")
+    allowed_hosts: List[str] = Field(default_factory=list, max_length=500)  # exact or "*.suffix"
+    github: Optional[GitHubEgressInput] = None
+
+
 class SessionCreateInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     agent_id: Optional[str] = Field(default=None, min_length=1)
@@ -2007,6 +2078,7 @@ class SessionCreateInput(BaseModel):
     environment_id: Optional[str] = None
     title: Optional[str] = Field(default=None, max_length=200)
     resources: Optional[List[ResourceInput]] = None
+    egress_policy: Optional[EgressPolicyInput] = None  # broker policy (merged with resource-derived)
     # Router-internal (HA): the router resolves the agent/environment definitions on whatever
     # node owns them and passes them inline, so a session can run on any node regardless of
     # where its agent/env were created. Ignored in the standalone agent_id flow.
@@ -2118,10 +2190,12 @@ async def api_agent_archive(agent_id: str):
 @api.post("/v1/sessions", status_code=201, tags=["Agent sessions"], summary="Create an agent session (boots a VM running the agent)")
 async def api_session_create(params: SessionCreateInput):
     resources = [r.model_dump() for r in params.resources] if params.resources else None
+    egress_policy = params.egress_policy.model_dump() if params.egress_policy else None
     try:
         return await _create_agent_session(params.agent_id, params.title,
                                            params.environment_id, params.agent_version,
-                                           resources, params.agent, params.environment)
+                                           resources, params.agent, params.environment,
+                                           egress_policy)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
@@ -2247,6 +2321,18 @@ async def api_session_delete(sid: str):
     rec["updated_at"] = time.time()
     AGENT_SESSIONS.put(sid, rec)
     return {"session_id": sid, "status": "terminated"}
+
+
+@api.post("/v1/sessions/{sid}/egress-policy", tags=["Agent sessions"], summary="Set a session's egress policy")
+async def api_session_set_egress(sid: str, params: EgressPolicyInput):
+    rec = AGENT_SESSIONS.get(sid)
+    if not rec:
+        raise HTTPException(status_code=404, detail=f"session '{sid}' not found")
+    rec["egress_policy"] = _derive_egress_policy(sid, rec.get("resources"), params.model_dump())
+    rec["updated_at"] = time.time()
+    AGENT_SESSIONS.put(sid, rec)
+    _rebuild_egress_index()
+    return {"session_id": sid, "egress_policy": rec["egress_policy"]}
 
 
 @api.get("/v1/sessions/{sid}/events", tags=["Agent sessions"], summary="Replay session events")

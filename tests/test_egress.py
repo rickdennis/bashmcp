@@ -87,6 +87,27 @@ def test_rebuild_egress_index_writes_file():
     print("PASS: _rebuild_egress_index writes the ip->policy index atomically")
 
 
+def test_session_create_input_accepts_egress_policy():
+    inp = server.SessionCreateInput(
+        agent_id="a",
+        egress_policy={"allowed_hosts": ["pypi.org"], "github": {"repos": ["acme/widgets"]}},
+    )
+    assert inp.egress_policy is not None
+    derived = server._derive_egress_policy("sesn_1", None, inp.egress_policy.model_dump())
+    assert "pypi.org" in derived["allowed_hosts"]
+    assert "acme/widgets" in derived["github"]["repos"]
+    print("PASS: SessionCreateInput accepts and round-trips an egress_policy")
+
+
+def test_egress_policy_input_rejects_unknown_field():
+    try:
+        server.EgressPolicyInput(bogus=1)
+    except Exception:
+        print("PASS: EgressPolicyInput rejects unknown fields (extra=forbid)")
+        return
+    raise AssertionError("EgressPolicyInput should reject unknown fields")
+
+
 if __name__ == "__main__":
     test_repo_slug()
     test_derive_egress_policy_from_resources()
@@ -94,4 +115,6 @@ if __name__ == "__main__":
     test_derive_egress_policy_none_when_empty()
     test_build_egress_index()
     test_rebuild_egress_index_writes_file()
+    test_session_create_input_accepts_egress_policy()
+    test_egress_policy_input_rejects_unknown_field()
     print("\nAll egress checks passed.")
