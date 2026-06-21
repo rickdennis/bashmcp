@@ -145,19 +145,28 @@ docker run --privileged \
   fc-bash-mcp
 ```
 
-### Kubernetes
+### Kubernetes (HA)
 
-`deployment.yaml` deploys to the `fc-mcp` namespace. The node needs KVM access (bare metal or nested virt):
+The current topology is a leader-elected **router** plus a node-agent **StatefulSet** (one pod per
+KVM-capable node), with routing state in `Session`/`NodeAgent` CRDs. Label the node pool, then
+apply the CRDs followed by the manifests:
 
 ```bash
-# Label a node with KVM access
-kubectl label node my-metal-node fc-mcp=true
+# Label the KVM-capable node pool
+kubectl label node <kvm-node> fc-mcp=true
 
-# Deploy (namespace, PVC, secret, deployment, service)
-kubectl apply -f deployment.yaml
+# CRDs first, then the router + node-agent StatefulSet + services/RBAC
+kubectl apply -f deploy/crds/
+kubectl apply -f kubernetes/
 ```
 
-Single replica only — VMs are local to the host the pod runs on. It runs `privileged` with `hostNetwork: true` (for tap-device visibility) and uses an initContainer to run `setup-network.sh`.
+Point Claude Code at the **router** Service (not a node). The node-agents run `privileged` with
+`hostNetwork: true` (tap-device visibility) and an initContainer that runs `setup-network.sh`;
+VMs are pinned to their node. For local end-to-end validation on a single KVM host,
+`kind/kind-up.sh` stands up the whole stack in a 3-worker kind cluster.
+
+> The earlier single-host manifest is retired to `archive/deployment.yaml` — superseded by this
+> StatefulSet topology and kept only for reference.
 
 ## Connecting Claude Code
 

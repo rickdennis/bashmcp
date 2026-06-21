@@ -174,7 +174,7 @@ Tests are pure Go (`cd fcctl && go test ./...`): CR/`/vms` parsing, the `vm_id�
 
 Two topologies live in the repo:
 
-- **Legacy single-host:** `deployment.yaml` (namespace `fc-mcp`, single replica, `hostNetwork`, `privileged`, `setup-network.sh` initContainer). Kept for reference.
+- **Legacy single-host:** retired to `archive/deployment.yaml` (namespace `fc-mcp`, single replica, `hostNetwork`, `privileged`, `setup-network.sh` initContainer). Superseded by the HA topology below; kept only for reference, not applied or tested.
 - **HA (current target):** apply `deploy/crds/` then `kubernetes/`:
   - **Node-agent `StatefulSet`** (`kubernetes/statefulset.yaml`) — one pod per node via hard `podAntiAffinity` (`topologyKey: kubernetes.io/hostname`) on the tainted/labeled `fc-mcp` pool; `hostNetwork`, `privileged`, `/dev/kvm` + `/dev/net/tun`; per-pod **local PV** (`volumeClaimTemplates`, StorageClass `fc-local`, `WaitForFirstConsumer`) so each pod is pinned to its node's disk; `NODE_NAME`/`POD_IP` from the downward API; `OnDelete` update strategy; a **preStop `/drain`** hook (+`terminationGracePeriodSeconds: 120`) that snapshots running VMs before the pod dies.
   - **Router `Deployment`** (`kubernetes/router-deployment.yaml`) — 2 replicas of `proxy.router`; leader-elected via a `coordination.k8s.io` Lease; **only the leader reports `/readyz` Ready**, so the `ClusterIP` Service (`router-service.yaml`) backs the single active replica. Auth/TLS terminate at your org ingress/gateway in front of it.
