@@ -1554,6 +1554,89 @@ ENVIRONMENTS = _JsonStore(BASE_DIR / "environments.json")
 AGENT_SESSIONS = _JsonStore(BASE_DIR / "agent-sessions.json")
 DEFAULT_AGENT_MODEL = os.environ.get("FC_AGENT_MODEL", "claude-sonnet-4-6")
 
+# --- Egress broker (fc-egress) policy index ---------------------------------------
+# The transparent egress proxy enforces per-session egress policy and injects credentials
+# *after* traffic leaves the VM (the VM holds no secrets). The proxy never queries us at
+# runtime: we denormalize a {vm-ip: egress_policy} map to this file on the shared PV and the
+# proxy mmaps/polls it (see egress/policy.go). Gated by FC_EGRESS_ENABLED.
+EGRESS_INDEX_PATH = BASE_DIR / "egress-index.json"
+
+
+def _repo_slug(repository_url: str) -> str:
+    """Normalize a repo reference (owner/repo shorthand, https URL, or git@ ssh) to 'owner/repo'."""
+    u = repository_url.strip()
+    if u.startswith("git@") and ":" in u:
+        u = u.split(":", 1)[1]
+    elif "://" in u:
+        rest = u.split("://", 1)[1]
+        u = rest.split("/", 1)[1] if "/" in rest else ""
+    u = u.strip("/")
+    if u.endswith(".git"):
+        u = u[:-4]
+    segs = [s for s in u.split("/") if s]
+    return f"{segs[-2]}/{segs[-1]}" if len(segs) >= 2 else u
+
+
+def _derive_egress_policy(session_id: str, resources, explicit: Optional[Dict]) -> Optional[Dict]:
+    """Build a session's egress_policy from its github_repository resources, merged with any
+    explicit policy. Returns None when there is nothing to permit (default-deny everywhere)."""
+    repos: List[str] = []
+    hosts = set()
+    for r in (resources or []):
+        if (r or {}).get("type") == "github_repository":
+            repos.append(_repo_slug(r["repository_url"]))
+            hosts.update(("github.com", "*.githubusercontent.com"))
+    if explicit:
+        hosts.update(explicit.get("allowed_hosts") or [])
+        gh = explicit.get("github") or {}
+        repos.extend(gh.get("repos") or [])
+    if not repos and not hosts and not explicit:
+        return None
+    deduped = list(dict.fromkeys(repos))
+    pol: Dict[str, Any] = {"session_id": session_id, "mode": "default_deny",
+                           "allowed_hosts": sorted(hosts)}
+    if deduped:
+        pol["github"] = {"repos": deduped}
+    return pol
+
+
+def _ip_of_record(record: Dict) -> Optional[str]:
+    if record.get("ip_address"):
+        return record["ip_address"]
+    slot = _record_slot(record)
+    return f"172.16.0.{slot}" if slot is not None else None
+
+
+def _build_egress_index(vm_records: List[Dict], sessions: List[Dict]) -> Dict[str, Dict]:
+    """Join each session's egress_policy to its VM's IP -> {ip: policy}. Sessions without a
+    policy, or whose VM isn't present, are omitted (so the proxy default-denies them)."""
+    ip_by_vm = {}
+    for v in vm_records:
+        ip = _ip_of_record(v)
+        if ip:
+            ip_by_vm[v.get("vm_id")] = ip
+    idx: Dict[str, Dict] = {}
+    for s in sessions:
+        pol = s.get("egress_policy")
+        ip = ip_by_vm.get(s.get("vm_id"))
+        if pol and ip:
+            idx[ip] = pol
+    return idx
+
+
+def _rebuild_egress_index() -> None:
+    """Atomically rewrite egress-index.json from current VM + session state. Called on every
+    lifecycle change that affects the mapping (session create/terminate, policy edit, VM
+    create/destroy/pause-resume). Best-effort: a failure here must never break the operation."""
+    try:
+        idx = _build_egress_index(_vm_state.list_all(), AGENT_SESSIONS.all())
+        EGRESS_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = EGRESS_INDEX_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(idx, indent=2))
+        tmp.replace(EGRESS_INDEX_PATH)
+    except Exception as e:  # noqa: BLE001
+        log.warning("egress index rebuild failed: %s", e)
+
 # Map managed-agents-style toolset names (agent_toolset_20260401: bash/edit/read/…) onto the
 # Claude Agent SDK's tool names. Done host-side (here) so the runner always receives SDK names
 # and needs no rebuild when the mapping changes. Already-correct SDK names pass through.
