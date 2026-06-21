@@ -26,7 +26,7 @@ echo "==> Mounting image..."
 mount -o loop "$ROOTFS" "$MOUNT_DIR"
 
 echo "==> Running debootstrap (Ubuntu 22.04 jammy)..."
-debootstrap --include=curl,wget,vim,git,htop,net-tools,iproute2,iputils-ping,sudo,bash,systemd,tmux \
+debootstrap --include=curl,wget,vim,git,htop,net-tools,iproute2,iputils-ping,sudo,bash,systemd,tmux,ca-certificates \
     jammy "$MOUNT_DIR" http://archive.ubuntu.com/ubuntu/
 
 # ── 3. Configure the system ───────────────────────────────────────────────────
@@ -75,6 +75,24 @@ EOF
     chroot "$MOUNT_DIR" systemctl enable fc-agent.service 2>/dev/null || \
         ln -sf /etc/systemd/system/fc-agent.service \
             "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/fc-agent.service"
+
+    # Register the egress MITM CA at boot (the host drops fc-egress.crt into the overlay's
+    # /usr/local/share/ca-certificates at VM-create; harmless no-op when egress is disabled).
+    cat > "$MOUNT_DIR/etc/systemd/system/fc-egress-ca.service" <<'EOF'
+[Unit]
+Description=fc-mcp register egress MITM CA
+DefaultDependencies=no
+Before=fc-agent.service sysinit.target
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/update-ca-certificates
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+    chroot "$MOUNT_DIR" systemctl enable fc-egress-ca.service 2>/dev/null || \
+        ln -sf /etc/systemd/system/fc-egress-ca.service \
+            "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/fc-egress-ca.service"
 else
     echo "WARNING: fc-agent not found at $FC_AGENT_BIN — run 'bash scripts/build-agent.sh' first; rootfs will lack the agent."
 fi

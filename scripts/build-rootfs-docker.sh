@@ -50,7 +50,9 @@ COPY fc-agent /usr/local/bin/fc-agent
 RUN chmod 0755 /usr/local/bin/fc-agent \
  && mkdir -p /etc/fc-agent \
  && printf '[Unit]\nDescription=fc-mcp guest command agent\nAfter=network-online.target\nWants=network-online.target\n[Service]\nExecStart=/usr/local/bin/fc-agent --listen-http 2025 --listen-ws 2024 --allow-from 172.16.0.1 --token-file /etc/fc-agent/token\nRestart=always\nRestartSec=1\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/fc-agent.service \
- && ln -sf /etc/systemd/system/fc-agent.service /etc/systemd/system/multi-user.target.wants/fc-agent.service
+ && ln -sf /etc/systemd/system/fc-agent.service /etc/systemd/system/multi-user.target.wants/fc-agent.service \
+ && printf '[Unit]\nDescription=fc-mcp register egress MITM CA\nDefaultDependencies=no\nBefore=fc-agent.service sysinit.target\n[Service]\nType=oneshot\nExecStart=/usr/sbin/update-ca-certificates\nRemainAfterExit=yes\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/fc-egress-ca.service \
+ && ln -sf /etc/systemd/system/fc-egress-ca.service /etc/systemd/system/multi-user.target.wants/fc-egress-ca.service
 DOCKER2
 else
     echo "WARNING: fc-agent not found at $FC_AGENT_BIN — run 'bash scripts/build-agent.sh' first; rootfs will lack the agent."

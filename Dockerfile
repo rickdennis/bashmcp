@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
     python3 python3-pip \
     openssh-client \
     curl wget \
-    iproute2 iptables \
+    iproute2 iptables nftables \
     e2fsprogs \
     && rm -rf /var/lib/apt/lists/*
 
@@ -39,7 +39,9 @@ RUN uv sync --frozen --no-dev
 COPY server.py ./
 COPY scripts/start.sh scripts/setup-network.sh ./
 COPY proxy/ ./proxy/
-RUN chmod +x start.sh setup-network.sh
+# fc-egress (the egress broker sidecar/process). Cluster hosts are linux/amd64.
+COPY bin/fc-egress-amd64 /usr/local/bin/fc-egress
+RUN chmod +x start.sh setup-network.sh /usr/local/bin/fc-egress
 
 ENV FC_BASE_DIR=/opt/fc-mcp
 ENV MCP_PORT=8080
