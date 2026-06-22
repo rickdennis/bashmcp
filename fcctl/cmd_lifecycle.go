@@ -104,9 +104,12 @@ func execCmd() *cobra.Command {
 // resolveOne is the shared "find the owning node then act" helper. The timeout is
 // the HTTP ceiling for the operation's client — set per-op so a slow pause/resume/
 // destroy isn't cut off by the short discovery timeout.
-func resolveOne(id string, timeout time.Duration, action func(*NodeClient) error) error {
+// resolveOne resolves a vm_id (prefix or full) to a node client and calls action
+// with the FULL vm_id. This ensures the node-agent receives the complete UUID even
+// when the user typed the 8-char display prefix from `fcctl top`.
+func resolveOne(id string, timeout time.Duration, action func(*NodeClient, string) error) error {
 	g := gather()
-	node, ok := g.resolveNode(id)
+	node, fullID, ok := g.resolveVM(id)
 	if !ok {
 		return fmt.Errorf("no such VM %s on any node", id)
 	}
@@ -114,18 +117,18 @@ func resolveOne(id string, timeout time.Duration, action func(*NodeClient) error
 	if client == nil {
 		return fmt.Errorf("owning node %s for %s is unreachable", node, id)
 	}
-	return action(client)
+	return action(client, fullID)
 }
 
 func pauseCmd() *cobra.Command {
 	return &cobra.Command{
 		Use: "pause <vm_id>", Short: "Snapshot + pause a VM", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return resolveOne(args[0], pauseTimeout, func(c *NodeClient) error {
-				if err := c.Pause(args[0]); err != nil {
+			return resolveOne(args[0], pauseTimeout, func(c *NodeClient, id string) error {
+				if err := c.Pause(id); err != nil {
 					return err
 				}
-				fmt.Printf("paused %s on %s\n", args[0], c.Node)
+				fmt.Printf("paused %s on %s\n", id, c.Node)
 				return nil
 			})
 		},
@@ -136,11 +139,11 @@ func resumeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use: "resume <vm_id>", Short: "Resume a VM from its snapshot", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return resolveOne(args[0], resumeTimeout, func(c *NodeClient) error {
-				if err := c.Resume(args[0]); err != nil {
+			return resolveOne(args[0], resumeTimeout, func(c *NodeClient, id string) error {
+				if err := c.Resume(id); err != nil {
 					return err
 				}
-				fmt.Printf("resumed %s on %s\n", args[0], c.Node)
+				fmt.Printf("resumed %s on %s\n", id, c.Node)
 				return nil
 			})
 		},
@@ -151,14 +154,14 @@ func destroyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use: "destroy <vm_id>", Short: "Destroy a VM and delete all its data", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return resolveOne(args[0], destroyTimeout, func(c *NodeClient) error {
-				if !confirm(fmt.Sprintf("About to destroy VM %s on %s.", args[0], c.Node)) {
+			return resolveOne(args[0], destroyTimeout, func(c *NodeClient, id string) error {
+				if !confirm(fmt.Sprintf("About to destroy VM %s on %s.", id, c.Node)) {
 					return fmt.Errorf("aborted")
 				}
-				if err := c.Destroy(args[0]); err != nil {
+				if err := c.Destroy(id); err != nil {
 					return err
 				}
-				fmt.Printf("destroyed %s\n", args[0])
+				fmt.Printf("destroyed %s\n", id)
 				return nil
 			})
 		},

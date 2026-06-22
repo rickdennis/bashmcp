@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Gather is the full cluster snapshot used by `ls` and `top`.
 type Gather struct {
@@ -65,8 +68,28 @@ func (g Gather) opClients(timeout time.Duration) []*NodeClient {
 	return clientsFromNodeAgents(g.NodeAgents, g.Port, timeout)
 }
 
-// resolveNode finds which node owns a vm_id (by the fanned /vms index).
+// resolveNode finds which node owns a vm_id. Accepts a full UUID or a unique prefix
+// (the 8-char display IDs shown in `fcctl top` and `fcctl ls vms`).
 func (g Gather) resolveNode(vmID string) (string, bool) {
-	node, ok := indexVMs(g.VMsByNode)[vmID]
+	node, _, ok := g.resolveVM(vmID)
 	return node, ok
+}
+
+// resolveVM resolves a vm_id prefix to (node, fullID). Use this when the full UUID
+// is needed for the subsequent API call (e.g. destroy, pause, exec).
+func (g Gather) resolveVM(vmID string) (node, fullID string, ok bool) {
+	idx := indexVMs(g.VMsByNode)
+	if n, found := idx[vmID]; found {
+		return n, vmID, true
+	}
+	var matched, matchedNode string
+	for full, n := range idx {
+		if strings.HasPrefix(full, vmID) {
+			if matched != "" {
+				return "", "", false // ambiguous
+			}
+			matched, matchedNode = full, n
+		}
+	}
+	return matchedNode, matched, matched != ""
 }
