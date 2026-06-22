@@ -101,15 +101,24 @@ func countByStatus(vmsByNode map[string][]VM, status string) int {
 	return n
 }
 
+// podName returns the NodeAgent's pod name (metadata.name = fc-node-agent-0/1/2).
+// Falls back to spec.nodeName for older CRs that predate the rename.
+func podName(na NodeAgent) string {
+	if na.Meta.Name != "" {
+		return na.Meta.Name
+	}
+	return na.Spec.NodeName
+}
+
 // nodeAgentRows: NODE PHASE FREE RUN PAUSE ERR HEARTBEAT REACH
 func nodeAgentRows(now time.Time, nas []NodeAgent, vmsByNode map[string][]VM, reachable map[string]bool) [][]string {
 	sorted := append([]NodeAgent(nil), nas...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Spec.NodeName < sorted[j].Spec.NodeName })
+	sort.Slice(sorted, func(i, j int) bool { return podName(sorted[i]) < podName(sorted[j]) })
 	rows := make([][]string, 0, len(sorted))
 	for _, n := range sorted {
-		node := n.Spec.NodeName
+		nodeName := n.Spec.NodeName // used for vmsByNode + reachable lookups (keyed by k8s node)
 		var run, pause, errc int
-		for _, v := range vmsByNode[node] {
+		for _, v := range vmsByNode[nodeName] {
 			switch v.Status {
 			case "running":
 				run++
@@ -120,11 +129,11 @@ func nodeAgentRows(now time.Time, nas []NodeAgent, vmsByNode map[string][]VM, re
 			}
 		}
 		reach := "down"
-		if reachable[node] {
+		if reachable[nodeName] {
 			reach = "ok"
 		}
 		rows = append(rows, []string{
-			node, n.Status.Phase, fmt.Sprintf("%d", n.Status.FreeTaps),
+			podName(n), n.Status.Phase, fmt.Sprintf("%d", n.Status.FreeTaps),
 			fmt.Sprintf("%d", run), fmt.Sprintf("%d", pause), fmt.Sprintf("%d", errc),
 			ageISO(now, n.Status.HeartbeatTime), reach,
 		})
@@ -256,7 +265,7 @@ func renderDashboard(g Gather, now time.Time) string {
 	b.WriteString(renderTable("NodeAgents", []string{"NODE", "PHASE", "FREE", "RUN", "PAUSE", "ERR", "HEARTBEAT", "REACH"},
 		nodeAgentRows(now, g.NodeAgents, g.VMsByNode, g.Reachable), 1, 7))
 	b.WriteString("\n")
-	b.WriteString(renderTable("Sessions", []string{"SESSION", "NODE", "VM", "PHASE", "AGE"},
+	b.WriteString(renderTable("MCP Sessions (router)", []string{"SESSION", "NODE", "VM", "PHASE", "AGE"},
 		sessionRows(now, g.Sessions), 3))
 	b.WriteString("\n")
 	b.WriteString(renderTable("VMs", []string{"NODE", "VM", "NAME", "STATUS", "IP", "CPU", "MEM", "SNAP", "AGE"},

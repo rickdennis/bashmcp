@@ -33,7 +33,7 @@ func lsCmd() *cobra.Command {
 				if isJSON() {
 					return jsonOut(ss)
 				}
-				fmt.Println(renderTable("Sessions", []string{"SESSION", "NODE", "VM", "PHASE", "AGE"},
+				fmt.Println(renderTable("MCP Sessions (router)", []string{"SESSION", "NODE", "VM", "PHASE", "AGE"},
 					sessionRows(now, ss), 3))
 				return nil
 			case "nodes":
