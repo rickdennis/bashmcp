@@ -66,7 +66,7 @@ func rootCmd() *cobra.Command {
 	root.AddCommand(
 		lsCmd(), getCmd(), createCmd(), execCmd(),
 		pauseCmd(), resumeCmd(), restoreCmd(), destroyCmd(),
-		drainCmd(), resetCmd(), topCmd(),
+		drainCmd(), resetCmd(), topCmd(), sessionCmd(),
 	)
 	return root
 }
