@@ -1,12 +1,20 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"testing"
 )
+
+func TestDenyTokenSource(t *testing.T) {
+	if _, _, err := (denyTokenSource{fmt.Errorf("nope")}).Token(context.Background(), "s", "o", "r"); err == nil {
+		t.Errorf("denyTokenSource must always error (fail closed)")
+	}
+}
 
 func TestParseRSAPrivateKey_PKCS1(t *testing.T) {
 	k, _ := rsa.GenerateKey(rand.Reader, 2048)

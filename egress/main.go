@@ -38,7 +38,10 @@ func main() {
 
 	ts, err := buildTokenSource(cfg)
 	if err != nil {
-		log.Fatalf("token source: %v", err)
+		// Don't crashloop the sidecar when creds aren't configured yet: run the data plane
+		// (default-deny still enforced) and fail GitHub injection closed until configured.
+		log.Printf("WARNING: GitHub token source unavailable (%v); GitHub egress denied until configured", err)
+		ts = denyTokenSource{err}
 	}
 	registry := NewRegistry(NewGitHubAdapter(newCachingTokenSource(ts, cfg.TokenSkew)))
 	resolver := newFileIndexResolver(cfg.IndexPath)
@@ -85,6 +88,14 @@ func serveHealth(ctx context.Context, addr string) {
 	srv := &http.Server{Addr: addr, Handler: mux}
 	go func() { <-ctx.Done(); _ = srv.Close() }()
 	_ = srv.ListenAndServe()
+}
+
+// denyTokenSource fails closed: the data plane runs (everything default-denies) but GitHub
+// injection errors, so a misconfigured/unconfigured backend degrades instead of crashlooping.
+type denyTokenSource struct{ err error }
+
+func (d denyTokenSource) Token(_ context.Context, _, _, _ string) (string, time.Time, error) {
+	return "", time.Time{}, fmt.Errorf("github egress backend not configured: %w", d.err)
 }
 
 // buildTokenSource selects the GitHub credential backend.

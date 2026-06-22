@@ -48,7 +48,12 @@ spec:
         - name: network-setup
           image: fc-bash-mcp:latest
           imagePullPolicy: IfNotPresent   # use the kind-loaded image; :latest would otherwise default to Always
-          command: ["bash", "setup-network.sh"]
+          # Lay the bridge/NAT + (FC_EGRESS_ENABLED) nft TPROXY rules, then generate the egress
+          # CA once onto the shared PV so both the node-agent and the sidecar read the same cert.
+          command: ["sh", "-c", "bash setup-network.sh && mkdir -p /opt/fc-mcp/egress-ca && fc-egress --generate-ca --ca-cert /opt/fc-mcp/egress-ca/ca.crt --ca-key /opt/fc-mcp/egress-ca/ca.key"]
+          env:
+            - name: FC_EGRESS_ENABLED
+              value: "1"
           securityContext:
             privileged: true
           volumeMounts:
@@ -80,6 +85,8 @@ spec:
               value: "32"            # must match the tap count in setup-network.sh
             - name: FC_IDLE_PAUSE_SECONDS
               value: "300"           # snapshot+pause VMs idle >5min (frees RAM/CPU); next exec auto-resumes
+            - name: FC_EGRESS_ENABLED  # install egress CA into VMs + secretless clone + write egress-index.json
+              value: "1"
             # Archive paused-VM snapshots to S3 so they survive node loss (recover via /restore).
             # Unset = disabled. Creds via boto3 default chain (EC2 instance role through IMDS here
             # since hostNetwork; IRSA on EKS — see rbac.yaml). Needs s3:Get/Put/Delete/List.
@@ -126,6 +133,51 @@ spec:
               mountPath: /dev/kvm
             - name: dev-net-tun
               mountPath: /dev/net/tun
+        # ── Egress broker sidecar ──────────────────────────────────────────────
+        # Shares the pod netns (hostNetwork) + the per-node PV that hosts the VMs, so it reads
+        # egress-index.json + egress-ca/ exactly where the node-agent writes them (no kube
+        # RBAC, no API calls on the hot path). nft TPROXY rules come from the init container.
+        - name: fc-egress
+          image: fc-bash-mcp:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/fc-egress"]
+          args:
+            - "--listen=127.0.0.1:3129"
+            - "--health=127.0.0.1:3130"
+            - "--index=/opt/fc-mcp/egress-index.json"
+            - "--ca-cert=/opt/fc-mcp/egress-ca/ca.crt"
+            - "--ca-key=/opt/fc-mcp/egress-ca/ca.key"
+            - "--fwmark=1"
+            - "--github-backend=$(FC_EGRESS_GITHUB_BACKEND)"
+            - "--octosts-url=$(FC_EGRESS_OCTOSTS_URL)"
+            - "--app-id=$(FC_EGRESS_APP_ID)"
+            - "--app-key=/etc/fc-egress/github-app.pem"
+          env:
+            - name: FC_EGRESS_GITHUB_BACKEND
+              value: "appmint"        # flip to "octosts" once the OIDC issuer is wired (open item)
+            - name: FC_EGRESS_OCTOSTS_URL
+              value: ""
+            - name: FC_EGRESS_APP_ID
+              value: "0"              # set to your GitHub App ID (appmint backend)
+          securityContext:
+            privileged: true          # NET_ADMIN for IP_TRANSPARENT + SO_MARK
+          livenessProbe:
+            exec: {command: ["/bin/sh", "-c", "curl -fsS http://127.0.0.1:3130/health"]}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            exec: {command: ["/bin/sh", "-c", "curl -fsS http://127.0.0.1:3130/health"]}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: {cpu: "100m", memory: "64Mi"}
+            limits: {cpu: "1", memory: "256Mi"}
+          volumeMounts:
+            - name: fc-data            # SAME PV as the node-agent (hosts the VMs + the index/CA)
+              mountPath: /opt/fc-mcp
+            - name: fc-egress-github   # optional GitHub App key for the appmint backend
+              mountPath: /etc/fc-egress
+              readOnly: true
       volumes:
         - name: vm-images
           hostPath: {path: /opt/fc-seed/vm-images, type: Directory}
@@ -135,6 +187,10 @@ spec:
           hostPath: {path: /dev/kvm, type: CharDevice}
         - name: dev-net-tun
           hostPath: {path: /dev/net/tun, type: CharDevice}
+        - name: fc-egress-github            # GitHub App key for the appmint backend; optional so
+          secret:                           # the pod starts unconfigured (egress fails closed).
+            secretName: fc-egress-github
+            optional: true
   volumeClaimTemplates:
     - metadata:
         name: fc-data
