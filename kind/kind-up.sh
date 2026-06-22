@@ -69,6 +69,7 @@ else
 fi
 
 log "3/8  build + load image $IMAGE"
+bash "$REPO_DIR/scripts/build-egress.sh"   # produces bin/fc-egress-amd64 that the Dockerfile COPYs (needs Go)
 docker build -t "$IMAGE" "$REPO_DIR"
 kind load docker-image "$IMAGE" --name "$CLUSTER"
 
