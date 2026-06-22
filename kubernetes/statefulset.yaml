@@ -12,7 +12,7 @@ metadata:
     app: fc-node-agent
 spec:
   serviceName: fc-node          # the headless Service
-  replicas: 2                   # == number of nodes in the fc-mcp pool (adjust)
+  replicas: 3                   # == number of nodes in the fc-mcp pool (adjust)
   podManagementPolicy: Parallel # nodes are independent; no ordering dependency
   updateStrategy:
     type: OnDelete              # upgrades are deliberate (each restart bounces a node's VMs)
@@ -73,6 +73,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: POD_NAME          # used as the NodeAgent CR name so pod + CR share one identifier
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: POD_IP            # hostNetwork: this is the node IP the router POSTs to
               valueFrom:
                 fieldRef:
@@ -147,7 +151,7 @@ spec:
             - "--index=/opt/fc-mcp/egress-index.json"
             - "--ca-cert=/opt/fc-mcp/egress-ca/ca.crt"
             - "--ca-key=/opt/fc-mcp/egress-ca/ca.key"
-            - "--fwmark=1"
+            - "--fwmark=0"  # DNAT mode: saddr-scoped rule prevents re-interception without SO_MARK
             - "--github-backend=$(FC_EGRESS_GITHUB_BACKEND)"
             - "--octosts-url=$(FC_EGRESS_OCTOSTS_URL)"
             - "--app-id=$(FC_EGRESS_APP_ID)"

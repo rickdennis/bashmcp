@@ -501,11 +501,25 @@ async def _write_egress_ca(vm_id: str):
         if m.returncode != 0:
             raise RuntimeError(f"egress-ca mount failed: {merr.decode(errors='replace')}")
         try:
+            ca_bytes = ca_crt.read_bytes()
+            # 1. Drop into the standard custom-anchor dir for when update-ca-certificates runs.
             anchors = mnt / "usr" / "local" / "share" / "ca-certificates"
             anchors.mkdir(parents=True, exist_ok=True)
-            dst = anchors / "fc-egress.crt"
-            dst.write_bytes(ca_crt.read_bytes())
-            dst.chmod(0o644)
+            (anchors / "fc-egress.crt").write_bytes(ca_bytes)
+            (anchors / "fc-egress.crt").chmod(0o644)
+            # 2. Also append directly to the system bundle file that git/libcurl/openssl read
+            # without `update-ca-certificates` needing to run first (handles base rootfs that
+            # predate the fc-egress-ca.service oneshot).
+            bundle = mnt / "etc" / "ssl" / "certs" / "ca-certificates.crt"
+            if bundle.exists():
+                existing = bundle.read_bytes()
+                if ca_bytes not in existing:  # idempotent
+                    bundle.write_bytes(existing + b"\n" + ca_bytes)
+            # 3. Individual PEM in the certs dir for c_rehash / SSL_CERT_DIR consumers.
+            certs_dir = mnt / "etc" / "ssl" / "certs"
+            certs_dir.mkdir(parents=True, exist_ok=True)
+            (certs_dir / "fc-egress.pem").write_bytes(ca_bytes)
+            (certs_dir / "fc-egress.pem").chmod(0o644)
         finally:
             u = await asyncio.create_subprocess_exec(
                 "umount", str(mnt),
@@ -1074,7 +1088,10 @@ async def publish_nodeagent_loop():
 
     group, version, plural = "fcmcp.io", "v1alpha1", "nodeagents"
     namespace = os.environ.get("FC_MCP_NAMESPACE", "fc-mcp")
-    name = NODE_NAME or os.environ.get("POD_NAME") or "node-agent"
+    # Use pod name (fc-node-agent-0/1/2) as the CR name so NodeAgent and pod are the same
+    # identifier. NODE_NAME (the k8s node name, e.g. fc-mcp-worker3) is kept in spec so the
+    # router can still correlate a NodeAgent to its underlying node if needed.
+    pod_name = os.environ.get("POD_NAME") or NODE_NAME or "node-agent"
     pod_ip = os.environ.get("POD_IP", "")
     max_vms = int(os.environ.get("FC_MAX_VMS", str(SLOT_MAX - SLOT_MIN + 1)))
     merge = "application/merge-patch+json"
@@ -1082,8 +1099,8 @@ async def publish_nodeagent_loop():
     co = client.CustomObjectsApi(client.ApiClient())
     body = {
         "apiVersion": f"{group}/{version}", "kind": "NodeAgent",
-        "metadata": {"name": name, "labels": {"fcmcp.io/node": name}},
-        "spec": {"nodeName": name, "podIP": pod_ip, "maxVms": max_vms},
+        "metadata": {"name": pod_name, "labels": {"fcmcp.io/node": pod_name, "fcmcp.io/k8s-node": NODE_NAME}},
+        "spec": {"nodeName": NODE_NAME, "podName": pod_name, "podIP": pod_ip, "maxVms": max_vms},
     }
     try:
         await co.create_namespaced_custom_object(group, version, namespace, plural, body)
@@ -1103,10 +1120,10 @@ async def publish_nodeagent_loop():
             }}
             try:
                 await co.patch_namespaced_custom_object_status(
-                    group, version, namespace, plural, name, status_body, _content_type=merge)
+                    group, version, namespace, plural, pod_name, status_body, _content_type=merge)
             except TypeError:
                 await co.patch_namespaced_custom_object_status(
-                    group, version, namespace, plural, name, status_body)
+                    group, version, namespace, plural, pod_name, status_body)
         except asyncio.CancelledError:
             raise
         except Exception as e:
