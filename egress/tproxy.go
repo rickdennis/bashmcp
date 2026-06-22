@@ -40,6 +40,13 @@ func (d *tproxyDataPlane) Serve(ctx context.Context) error {
 				serr = e
 				return
 			}
+			// SO_REUSEPORT lets a new fc-egress process bind the same port immediately after a
+			// crash/restart without waiting for the kernel to release it (avoids "address already
+			// in use" in CrashLoopBackOff scenarios).
+			if e := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 15 /*SO_REUSEPORT*/, 1); e != nil {
+				serr = e
+				return
+			}
 			// IP_TRANSPARENT: accept connections addressed to other IPs and preserve the
 			// original destination as the socket's local address.
 			serr = syscall.SetsockoptInt(int(fd), syscall.SOL_IP, syscall.IP_TRANSPARENT, 1)
