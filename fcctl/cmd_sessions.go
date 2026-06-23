@@ -31,9 +31,8 @@ type SessionRes struct {
 }
 
 type EgressPolicy struct {
-	Mode         string          `json:"mode"`
-	AllowedHosts []string        `json:"allowed_hosts"`
-	GitHub       *GitHubEgress   `json:"github,omitempty"`
+	AllowedHosts []string      `json:"allowed_hosts"`
+	GitHub       *GitHubEgress `json:"github,omitempty"`
 }
 
 type GitHubEgress struct {
@@ -124,7 +123,6 @@ func sessionCreateCmd() *cobra.Command {
 
 			if len(repos) > 0 || len(hosts) > 0 {
 				pol := &EgressPolicy{
-					Mode:         "default_deny",
 					AllowedHosts: append([]string{"github.com", "*.githubusercontent.com"}, hosts...),
 				}
 				if len(repos) > 0 {
@@ -200,7 +198,6 @@ func sessionEgressCmd() *cobra.Command {
 				return err
 			}
 			pol := EgressPolicy{
-				Mode:         "default_deny",
 				AllowedHosts: append([]string{"github.com", "*.githubusercontent.com"}, hosts...),
 			}
 			if len(repos) > 0 {
