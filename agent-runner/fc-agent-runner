@@ -1,0 +1,16 @@
+#!/bin/sh
+# Launch the in-VM Claude agent runner with the host-injected Anthropic credentials.
+# Parses /etc/fc-agent-runner/anthropic.env SAFELY — only exports ANTHROPIC_*/CLAUDE_*
+# KEY=VALUE lines; it never sources the file, so a malformed/bare value can't be executed
+# or echoed. Then execs the Node SDK runner.
+export HOME="${HOME:-/root}"   # async-exec env has no HOME; the SDK/CLI needs one for its config/cache
+export IS_SANDBOX=1            # this microVM IS the sandbox: allow root + bypassPermissions (Claude Code guard)
+ENV_FILE=/etc/fc-agent-runner/anthropic.env
+if [ -f "$ENV_FILE" ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      ANTHROPIC_*=*|CLAUDE_*=*) export "$line" ;;
+    esac
+  done < "$ENV_FILE"
+fi
+exec node /usr/local/lib/fc-agent-runner/runner.mjs "$@"

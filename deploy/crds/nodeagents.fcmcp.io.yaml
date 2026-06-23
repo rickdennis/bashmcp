@@ -1,0 +1,59 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: nodeagents.fcmcp.io
+spec:
+  group: fcmcp.io
+  scope: Namespaced
+  names:
+    kind: NodeAgent
+    plural: nodeagents
+    singular: nodeagent
+    shortNames: [na]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: >-
+            One per node-agent pod. Advertises identity, address and capacity so
+            the router can place sessions without inventing a capacity counter.
+            status.freeTaps (reported by the agent from its SlotAllocator) is the
+            single capacity authority; the agent's local check is the backstop.
+          properties:
+            spec:
+              type: object
+              required: [nodeName]
+              properties:
+                nodeName: {type: string}
+                podIP:
+                  type: string
+                  description: hostNetwork pod IP (== node IP); where the router POSTs /exec.
+                maxVms:
+                  type: integer
+                  description: Tap count from setup-network.sh (hard cap, default 32).
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Ready, NotReady, Gone]
+                freeTaps:
+                  type: integer
+                runningVmCount:
+                  type: integer
+                heartbeatTime:
+                  type: string
+                  format: date-time
+      additionalPrinterColumns:
+        - {name: Node, type: string, jsonPath: .spec.nodeName}
+        - {name: Phase, type: string, jsonPath: .status.phase}
+        - {name: Free, type: integer, jsonPath: .status.freeTaps}
+        - {name: VMs, type: integer, jsonPath: .status.runningVmCount}
+        - {name: Max, type: integer, jsonPath: .spec.maxVms}
+        - {name: Heartbeat, type: string, jsonPath: .status.heartbeatTime}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}

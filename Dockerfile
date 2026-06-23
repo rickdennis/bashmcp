@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
     python3 python3-pip \
     openssh-client \
     curl wget \
-    iproute2 iptables \
+    iproute2 iptables nftables \
     e2fsprogs \
     && rm -rf /var/lib/apt/lists/*
 
@@ -25,7 +25,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 ARG FC_VERSION=v1.10.1
 RUN ARCH=$(uname -m) && \
     curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-${ARCH}.tgz" \
-    | tar -xz --strip-components=1 && \
+    | tar -xz && \
     mv "release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}" /usr/bin/firecracker && \
     mv "release-${FC_VERSION}-${ARCH}/jailer-${FC_VERSION}-${ARCH}" /usr/bin/jailer && \
     chmod +x /usr/bin/firecracker /usr/bin/jailer && \
@@ -36,8 +36,12 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
-COPY server.py start.sh ./
-RUN chmod +x start.sh
+COPY server.py ./
+COPY scripts/start.sh scripts/setup-network.sh ./
+COPY proxy/ ./proxy/
+# fc-egress (the egress broker sidecar/process). Cluster hosts are linux/amd64.
+COPY bin/fc-egress-amd64 /usr/local/bin/fc-egress
+RUN chmod +x start.sh setup-network.sh /usr/local/bin/fc-egress
 
 ENV FC_BASE_DIR=/opt/fc-mcp
 ENV MCP_PORT=8080
@@ -45,4 +49,7 @@ ENV MCP_HOST=0.0.0.0
 
 EXPOSE 8080
 
+# One image, two roles:
+#   node-agent (default): ./start.sh -> server.py  (needs KVM + privileged)
+#   router:    override command -> ["uv","run","python","-m","proxy.router","--port","8080"]
 ENTRYPOINT ["./start.sh"]

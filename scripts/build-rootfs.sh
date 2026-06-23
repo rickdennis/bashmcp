@@ -6,6 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"   # scripts/ lives under the repo root
 BASE_DIR="${FC_BASE_DIR:-/opt/fc-mcp}"
 IMAGES_DIR="$BASE_DIR/vm-images"
 ROOTFS="$IMAGES_DIR/ubuntu-22.04-base.ext4"
@@ -25,7 +26,7 @@ echo "==> Mounting image..."
 mount -o loop "$ROOTFS" "$MOUNT_DIR"
 
 echo "==> Running debootstrap (Ubuntu 22.04 jammy)..."
-debootstrap --include=openssh-server,curl,wget,vim,git,htop,net-tools,iproute2,iputils-ping,sudo,bash,systemd \
+debootstrap --include=curl,wget,vim,git,htop,net-tools,iproute2,iputils-ping,sudo,bash,systemd,tmux,ca-certificates \
     jammy "$MOUNT_DIR" http://archive.ubuntu.com/ubuntu/
 
 # ── 3. Configure the system ───────────────────────────────────────────────────
@@ -47,20 +48,54 @@ auto eth0
 iface eth0 inet dhcp
 EOF
 
-# SSH config - allow root login with key
-mkdir -p "$MOUNT_DIR/root/.ssh"
-chmod 700 "$MOUNT_DIR/root/.ssh"
+# No sshd: command exec goes through fc-agent (installed below). Serial getty kept for debug.
 
-# If we have a public key, install it
-if [[ -f "$BASE_DIR/vm_ssh_key.pub" ]]; then
-    cp "$BASE_DIR/vm_ssh_key.pub" "$MOUNT_DIR/root/.ssh/authorized_keys"
-    chmod 600 "$MOUNT_DIR/root/.ssh/authorized_keys"
+# ── fc-agent guest agent (HTTP command exec; replaces SSH) ────────────────────
+# The host drives commands into the VM via this agent over the tap instead of SSH.
+# Build it first with: bash scripts/build-agent.sh (produces the per-arch binaries in bin/).
+_fc_arch="$(case "$(uname -m)" in aarch64|arm64) echo arm64;; *) echo amd64;; esac)"
+FC_AGENT_BIN="${FC_AGENT_BIN:-$REPO_DIR/bin/fc-agent-$_fc_arch}"
+if [[ -f "$FC_AGENT_BIN" ]]; then
+    echo "==> Installing fc-agent guest agent..."
+    install -D -m 0755 "$FC_AGENT_BIN" "$MOUNT_DIR/usr/local/bin/fc-agent"
+    mkdir -p "$MOUNT_DIR/etc/fc-agent"   # per-VM token is written here into the overlay at VM-create time
+    cat > "$MOUNT_DIR/etc/systemd/system/fc-agent.service" <<'EOF'
+[Unit]
+Description=fc-mcp guest command agent
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=/usr/local/bin/fc-agent --listen-http 2025 --listen-ws 2024 --allow-from 172.16.0.1 --token-file /etc/fc-agent/token
+Restart=always
+RestartSec=1
+[Install]
+WantedBy=multi-user.target
+EOF
+    mkdir -p "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants"
+    chroot "$MOUNT_DIR" systemctl enable fc-agent.service 2>/dev/null || \
+        ln -sf /etc/systemd/system/fc-agent.service \
+            "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/fc-agent.service"
+
+    # Register the egress MITM CA at boot (the host drops fc-egress.crt into the overlay's
+    # /usr/local/share/ca-certificates at VM-create; harmless no-op when egress is disabled).
+    cat > "$MOUNT_DIR/etc/systemd/system/fc-egress-ca.service" <<'EOF'
+[Unit]
+Description=fc-mcp register egress MITM CA
+DefaultDependencies=no
+Before=fc-agent.service sysinit.target
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/update-ca-certificates
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+    chroot "$MOUNT_DIR" systemctl enable fc-egress-ca.service 2>/dev/null || \
+        ln -sf /etc/systemd/system/fc-egress-ca.service \
+            "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/fc-egress-ca.service"
+else
+    echo "WARNING: fc-agent not found at $FC_AGENT_BIN — run 'bash scripts/build-agent.sh' first; rootfs will lack the agent."
 fi
-
-# Allow root SSH login
-sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' "$MOUNT_DIR/etc/ssh/sshd_config"
-sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' "$MOUNT_DIR/etc/ssh/sshd_config"
-sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' "$MOUNT_DIR/etc/ssh/sshd_config"
 
 # Disable unnecessary services for faster boot
 chroot "$MOUNT_DIR" systemctl disable apt-daily.service apt-daily-upgrade.service \

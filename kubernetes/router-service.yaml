@@ -1,0 +1,21 @@
+# The single stable MCP endpoint Claude Code connects to (path /mcp).
+#
+# ClusterIP: auth + TLS terminate at your org ingress/gateway in front of this
+# Service (per the decided auth posture). Point the gateway at this Service, or
+# add an Ingress here referencing it. Only the leader router pod is Ready, so the
+# Service backs the active replica automatically.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fc-mcp-router
+  namespace: fc-mcp
+  labels:
+    app: fc-mcp-router
+spec:
+  type: ClusterIP
+  selector:
+    app: fc-mcp-router
+  ports:
+    - name: mcp-http
+      port: 8080
+      targetPort: 8080

@@ -7,6 +7,7 @@ set -euo pipefail
 BASE_DIR="${FC_BASE_DIR:-/opt/fc-mcp}"
 IMAGES_DIR="$BASE_DIR/vm-images"
 KERNEL="$IMAGES_DIR/vmlinux-5.10"
+ARCH=$(uname -m)   # x86_64 or aarch64 — the FC CI bucket carries both
 
 mkdir -p "$IMAGES_DIR"
 
@@ -21,7 +22,7 @@ if [[ "${FC_BUILD_KERNEL:-0}" == "1" ]]; then
     tar -xf /tmp/kernel.tar.xz -C /tmp
 
     # Use Firecracker's recommended minimal config
-    wget -q "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-x86_64-5.10.config" \
+    wget -q "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-${ARCH}-5.10.config" \
         -O "$KERNEL_SRC/.config"
 
     cd "$KERNEL_SRC"
@@ -34,10 +35,11 @@ else
 
     # AWS provides pre-built kernels for Firecracker
     # This is the recommended 5.10 kernel from the Firecracker team
-    KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.9/x86_64/vmlinux-5.10.225"
+    KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.9/${ARCH}/vmlinux-5.10.225"
 
     echo "Downloading from: $KERNEL_URL"
-    wget -q --show-progress "$KERNEL_URL" -O "$KERNEL"
+    # curl, not wget: AL2's wget 1.14 lacks --show-progress
+    curl -fL "$KERNEL_URL" -o "$KERNEL"
 fi
 
 chmod +x "$KERNEL"

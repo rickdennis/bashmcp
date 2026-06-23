@@ -17,7 +17,7 @@ die()  { echo "ERROR: $*" >&2; exit 1; }
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 [[ "$(uname -s)" == "Linux" ]] || die "Firecracker requires Linux."
-[[ "$(id -u)" -eq 0 ]]        || die "Run as root: sudo bash setup-firecracker.sh"
+[[ "$(id -u)" -eq 0 ]]        || die "Run as root: sudo bash scripts/setup-firecracker.sh"
 
 if [[ ! -e /dev/kvm ]]; then
     die "/dev/kvm not found. Enable KVM (Intel VT-x / AMD-V) or use a KVM-capable VM host."
@@ -70,7 +70,7 @@ fi
 
 # ── Step 4: Python dependencies ───────────────────────────────────────────────
 log "[4/6] Installing Python dependencies (uv sync)"
-(cd "$SCRIPT_DIR" && uv sync)
+(cd "$SCRIPT_DIR/.." && uv sync)   # pyproject.toml is at the repo root (scripts/ is one level down)
 ok "Python dependencies ready"
 
 # ── Step 5: Build VM images ───────────────────────────────────────────────────
@@ -107,7 +107,7 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Setup complete. Start the server with:"
 echo ""
-echo "    sudo FC_BASE_DIR=$FC_BASE_DIR bash start.sh"
+echo "    sudo FC_BASE_DIR=$FC_BASE_DIR bash scripts/start.sh"
 echo ""
 echo "  Then connect Claude Code:"
 echo ""

@@ -1,0 +1,23 @@
+# Keep the front door up and never drain more than one node's VMs at once.
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fc-mcp-router
+  namespace: fc-mcp
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: fc-mcp-router
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fc-node-agent
+  namespace: fc-mcp
+spec:
+  maxUnavailable: 1   # voluntary disruptions take at most one node's VMs at a time
+  selector:
+    matchLabels:
+      app: fc-node-agent

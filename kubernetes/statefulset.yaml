@@ -1,0 +1,206 @@
+# Node-agent StatefulSet: exactly one pod per node on the tainted fc-mcp pool.
+#
+# Hard podAntiAffinity (one per node) gives the single-process-per-node invariant the
+# code relies on; a local-PV volumeClaimTemplate pins each pod to its node's disk.
+# Set `replicas` to the node count of the fc-mcp pool.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: fc-node-agent
+  namespace: fc-mcp
+  labels:
+    app: fc-node-agent
+spec:
+  serviceName: fc-node          # the headless Service
+  replicas: 3                   # == number of nodes in the fc-mcp pool (adjust)
+  podManagementPolicy: Parallel # nodes are independent; no ordering dependency
+  updateStrategy:
+    type: OnDelete              # upgrades are deliberate (each restart bounces a node's VMs)
+  selector:
+    matchLabels:
+      app: fc-node-agent
+  template:
+    metadata:
+      labels:
+        app: fc-node-agent
+    spec:
+      serviceAccountName: fc-node-agent
+      nodeSelector:
+        fc-mcp: "true"
+      tolerations:
+        - key: fc-mcp
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:         # at most one node-agent per node
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: fc-node-agent
+              topologyKey: kubernetes.io/hostname
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 120   # room for preStop drain (pause+snapshot)
+      securityContext:
+        runAsUser: 0
+      initContainers:
+        - name: network-setup
+          image: fc-bash-mcp:latest
+          imagePullPolicy: IfNotPresent   # use the kind-loaded image; :latest would otherwise default to Always
+          # Lay the bridge/NAT + (FC_EGRESS_ENABLED) nft TPROXY rules, then generate the egress
+          # CA once onto the shared PV so both the node-agent and the sidecar read the same cert.
+          command: ["sh", "-c", "bash setup-network.sh && mkdir -p /opt/fc-mcp/egress-ca && fc-egress --generate-ca --ca-cert /opt/fc-mcp/egress-ca/ca.crt --ca-key /opt/fc-mcp/egress-ca/ca.key"]
+          env:
+            - name: FC_EGRESS_ENABLED
+              value: "1"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: fc-data
+              mountPath: /opt/fc-mcp
+      containers:
+        - name: fc-node-agent
+          image: fc-bash-mcp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: FC_BASE_DIR
+              value: /opt/fc-mcp
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME          # used as the NodeAgent CR name so pod + CR share one identifier
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP            # hostNetwork: this is the node IP the router POSTs to
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: FC_MCP_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: FC_MAX_VMS
+              value: "500"           # taps created on-demand; raise up to 65533 (172.16.0.0/16)
+            - name: FC_IDLE_PAUSE_SECONDS
+              value: "300"           # snapshot+pause VMs idle >5min (frees RAM/CPU); next exec auto-resumes
+            - name: FC_EGRESS_ENABLED  # install egress CA into VMs + secretless clone + write egress-index.json
+              value: "1"
+            # Archive paused-VM snapshots to S3 so they survive node loss (recover via /restore).
+            # Unset = disabled. Creds via boto3 default chain (EC2 instance role through IMDS here
+            # since hostNetwork; IRSA on EKS — see rbac.yaml). Needs s3:Get/Put/Delete/List.
+            - name: FC_S3_BUCKET
+              value: "fc-agent-sandbox-testing-558885799623"
+            - name: FC_S3_PREFIX
+              value: "fc-mcp/snapshots"
+            - name: AWS_REGION
+              value: "us-east-1"
+          securityContext:
+            privileged: true         # KVM + tap devices
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "curl -s -X POST http://localhost:8080/drain || true"]
+          startupProbe:              # generous: first boot may build/copy images
+            httpGet: {path: /health, port: 8080}
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /health, port: 8080}
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:            # 503 when full / not reconciled -> no new placement
+            httpGet: {path: /ready, port: 8080}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: {cpu: "500m", memory: "256Mi"}
+            limits: {cpu: "2", memory: "1Gi"}  # VM memory comes from the host, not here
+          volumeMounts:
+            - name: fc-data
+              mountPath: /opt/fc-mcp
+            # Shared read-only kernel+rootfs and the matching SSH key, seeded onto
+            # each node at /opt/fc-seed (the pod's PV is otherwise empty). In a real
+            # cluster these would be baked into the image / pulled from object store.
+            - name: vm-images
+              mountPath: /opt/fc-mcp/vm-images
+              readOnly: true
+            - name: vm-ssh-key
+              mountPath: /opt/fc-mcp/vm_ssh_key
+              readOnly: true
+            - name: kvm
+              mountPath: /dev/kvm
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+        # ── Egress broker sidecar ──────────────────────────────────────────────
+        # Shares the pod netns (hostNetwork) + the per-node PV that hosts the VMs, so it reads
+        # egress-index.json + egress-ca/ exactly where the node-agent writes them (no kube
+        # RBAC, no API calls on the hot path). nft TPROXY rules come from the init container.
+        - name: fc-egress
+          image: fc-bash-mcp:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/fc-egress"]
+          args:
+            - "--listen=127.0.0.1:3129"
+            - "--health=127.0.0.1:3130"
+            - "--index=/opt/fc-mcp/egress-index.json"
+            - "--ca-cert=/opt/fc-mcp/egress-ca/ca.crt"
+            - "--ca-key=/opt/fc-mcp/egress-ca/ca.key"
+            - "--fwmark=0"  # DNAT mode: saddr-scoped rule prevents re-interception without SO_MARK
+            - "--github-backend=$(FC_EGRESS_GITHUB_BACKEND)"
+            - "--octosts-url=$(FC_EGRESS_OCTOSTS_URL)"
+            - "--app-id=$(FC_EGRESS_APP_ID)"
+            - "--app-key=/etc/fc-egress/github-app.pem"
+          env:
+            - name: FC_EGRESS_GITHUB_BACKEND
+              value: "appmint"        # flip to "octosts" once the OIDC issuer is wired (open item)
+            - name: FC_EGRESS_OCTOSTS_URL
+              value: ""
+            - name: FC_EGRESS_APP_ID
+              value: "0"              # set to your GitHub App ID (appmint backend)
+          securityContext:
+            privileged: true          # NET_ADMIN for IP_TRANSPARENT + SO_MARK
+          livenessProbe:
+            exec: {command: ["/bin/sh", "-c", "curl -fsS http://127.0.0.1:3130/health"]}
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            exec: {command: ["/bin/sh", "-c", "curl -fsS http://127.0.0.1:3130/health"]}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: {cpu: "100m", memory: "64Mi"}
+            limits: {cpu: "1", memory: "256Mi"}
+          volumeMounts:
+            - name: fc-data            # SAME PV as the node-agent (hosts the VMs + the index/CA)
+              mountPath: /opt/fc-mcp
+            - name: fc-egress-github   # optional GitHub App key for the appmint backend
+              mountPath: /etc/fc-egress
+              readOnly: true
+      volumes:
+        - name: vm-images
+          hostPath: {path: /opt/fc-seed/vm-images, type: Directory}
+        - name: vm-ssh-key
+          hostPath: {path: /opt/fc-seed/vm_ssh_key, type: File}
+        - name: kvm
+          hostPath: {path: /dev/kvm, type: CharDevice}
+        - name: dev-net-tun
+          hostPath: {path: /dev/net/tun, type: CharDevice}
+        - name: fc-egress-github            # GitHub App key for the appmint backend; optional so
+          secret:                           # the pod starts unconfigured (egress fails closed).
+            secretName: fc-egress-github
+            optional: true
+  volumeClaimTemplates:
+    - metadata:
+        name: fc-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: fc-local
+        resources:
+          requests:
+            storage: 100Gi
