@@ -68,7 +68,7 @@ func execCmd() *cobra.Command {
 				return fmt.Errorf("empty command")
 			}
 			g := gather()
-			node, ok := g.resolveNode(id)
+			node, fullID, ok := g.resolveVM(id)
 			if !ok {
 				return fmt.Errorf("no such VM %s on any node", id)
 			}
@@ -78,7 +78,7 @@ func execCmd() *cobra.Command {
 			if client == nil {
 				return fmt.Errorf("owning node %s for %s is unreachable", node, id)
 			}
-			res, err := client.Exec(id, command, workdir, timeout)
+			res, err := client.Exec(fullID, command, workdir, timeout)
 			if err != nil {
 				return err
 			}
