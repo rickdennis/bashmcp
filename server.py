@@ -53,11 +53,14 @@ SSH_KEY_PATH = BASE_DIR / "vm_ssh_key"
 SESSION_VM_FILE = BASE_DIR / "session-vm.json"
 SLOTS_FILE = BASE_DIR / "slots.json"
 
-# A VM's slot index determines its bridge IP (172.16.0.{slot}) and tap device
-# (fc-tap-{slot-2:08x}). setup-network.sh pre-creates 32 taps, so slots run
-# SLOT_MIN..SLOT_MAX inclusive (32 values); the tap count is the hard cap.
+# A VM's slot index determines its bridge IP and tap device name.
+# Subnet is 172.16.0.0/16 (gateway 172.16.0.1), giving 65 533 usable VM slots.
+# IP formula: 172.16.{slot >> 8}.{slot & 0xff}  — slots 2–255 stay in 172.16.0.x
+# (backwards-compatible with records written under the old /24 scheme).
+# Tap devices are created on-demand at VM boot and destroyed at VM destroy.
+# SLOT_MAX is driven by FC_MAX_VMS (default 500); raise to taste, up to 65533.
 SLOT_MIN = 2
-SLOT_MAX = 33
+SLOT_MAX = SLOT_MIN + int(os.environ.get("FC_MAX_VMS", "500")) - 1
 
 # Node identity (Kubernetes downward API spec.nodeName); empty when run standalone.
 NODE_NAME = os.environ.get("NODE_NAME", "")
@@ -284,6 +287,24 @@ def _socket_path(vm_id: str) -> str:
 def _snapshot_dir(vm_id: str) -> Path:
     return SNAPSHOTS_DIR / vm_id
 
+def _slot_to_ip(slot: int) -> str:
+    """172.16.{slot >> 8}.{slot & 0xff} — /16 flat network, gateway at 172.16.0.1."""
+    return f"172.16.{(slot >> 8) & 0xff}.{slot & 0xff}"
+
+def _ip_to_slot(ip: str) -> Optional[int]:
+    """Reverse of _slot_to_ip: parse the third and fourth octets of a 172.16.x.x address."""
+    try:
+        parts = ip.split(".")
+        if len(parts) != 4 or parts[0] != "172" or parts[1] != "16":
+            return None
+        return (int(parts[2]) << 8) | int(parts[3])
+    except (ValueError, IndexError):
+        return None
+
+def _slot_to_tap(slot: int) -> str:
+    """Tap device name — 0-based hex index from SLOT_MIN."""
+    return f"fc-tap-{(slot - SLOT_MIN):08x}"
+
 def _record_slot(record: Optional[Dict]) -> Optional[int]:
     """The VM's stored slot, or derived from its stored IP for legacy records."""
     if not record:
@@ -292,10 +313,7 @@ def _record_slot(record: Optional[Dict]) -> Optional[int]:
         return record["slot"]
     ip = record.get("ip_address")
     if ip:
-        try:
-            return int(ip.rsplit(".", 1)[1])
-        except (ValueError, IndexError):
-            return None
+        return _ip_to_slot(ip)
     return None
 
 def _vm_ip(vm_id: str) -> str:
@@ -303,13 +321,13 @@ def _vm_ip(vm_id: str) -> str:
     if record and record.get("ip_address"):
         return record["ip_address"]
     slot = _record_slot(record)
-    return f"172.16.0.{slot if slot is not None else SLOT_MIN}"
+    return _slot_to_ip(slot if slot is not None else SLOT_MIN)
 
 def _vm_tap(vm_id: str) -> str:
     slot = _record_slot(_vm_state.get(vm_id))
     if slot is None:
         slot = SLOT_MIN
-    return f"fc-tap-{(slot - SLOT_MIN):08x}"
+    return _slot_to_tap(slot)
 
 def _touch(vm_id: str):
     """Mark a VM as active so the idle-pause loop won't reap it mid-use."""
@@ -429,7 +447,7 @@ async def _s3_restore_vm(vm_id: str) -> bool:
         "vm_id": vm_id, "name": meta.get("name") or f"vm-{vm_id[:8]}", "status": "paused",
         "vcpu": meta.get("vcpu", DEFAULT_VCPU), "mem_mb": meta.get("mem_mb", DEFAULT_MEM_MB),
         "disk_mb": meta.get("disk_mb", DEFAULT_DISK_MB), "slot": slot,
-        "ip_address": meta.get("ip_address") or (f"172.16.0.{slot}" if slot is not None else None),
+        "ip_address": meta.get("ip_address") or (_slot_to_ip(slot) if slot is not None else None),
         "snapshot": {"created_at": meta.get("created_at"),
                      "mem_path": str(snap_dir / "memory.bin"),
                      "state_path": str(snap_dir / "vmstate.bin")},
@@ -456,6 +474,42 @@ async def _s3_delete_vm(vm_id: str):
         log.info(f"s3-delete: removed archive for {vm_id}")
     except Exception as e:
         log.warning(f"s3-delete failed for {vm_id}: {e}")
+
+
+async def _ensure_tap(vm_id: str) -> None:
+    """Create the VM's tap device on-demand if it doesn't already exist.
+    Idempotent — safe to call on resume of a VM whose tap survived a restart."""
+    tap = _vm_tap(vm_id)
+    # Check existence first to avoid a noisy error on the common re-use path.
+    chk = await asyncio.create_subprocess_exec(
+        "ip", "link", "show", tap,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    await chk.communicate()
+    if chk.returncode == 0:
+        return  # already exists
+    for cmd in [
+        ["ip", "tuntap", "add", "dev", tap, "mode", "tap"],
+        ["ip", "link", "set", "dev", tap, "master", "fc-br0"],
+        ["ip", "link", "set", "dev", tap, "up"],
+    ]:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"tap setup {cmd}: {stderr.decode(errors='replace')}")
+    log.debug("created tap %s", tap)
+
+
+async def _release_tap(vm_id: str) -> None:
+    """Best-effort: delete the tap device when a VM is destroyed."""
+    tap = _vm_tap(vm_id)
+    proc = await asyncio.create_subprocess_exec(
+        "ip", "link", "delete", tap,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.communicate()  # ignore errors — tap may already be gone
 
 
 async def _create_overlay(vm_id: str, size_mb: int):
@@ -647,7 +701,7 @@ async def _launch_firecracker(vm_id: str, vcpu: int, mem_mb: int) -> int:
             "kernel_image_path": str(KERNEL_IMAGE),
             "boot_args": (
                 f"console=ttyS0 reboot=k panic=1 pci=off "
-                f"ip={_vm_ip(vm_id)}::172.16.0.1:255.255.255.0::eth0:off "
+                f"ip={_vm_ip(vm_id)}::172.16.0.1:255.255.0.0::eth0:off "
             )
         })
         await fc.put("/drives/rootfs", {
@@ -819,7 +873,7 @@ async def _allocate_and_create_record(vm_id: str, name: str, vcpu: int, mem_mb: 
         record = {
             "vm_id": vm_id, "name": name, "status": "creating",
             "vcpu": vcpu, "mem_mb": mem_mb, "disk_mb": disk_mb,
-            "slot": slot, "ip_address": f"172.16.0.{slot}",
+            "slot": slot, "ip_address": _slot_to_ip(slot),
             "created_at": time.time(), "last_activity": time.time(),
             "pid": None, "snapshot": None,
             "agent_token": secrets.token_urlsafe(32),
@@ -890,6 +944,7 @@ async def _resolve_session_vm(session_id: str) -> str:
     await _allocate_and_create_record(new_vm_id, name, DEFAULT_VCPU, DEFAULT_MEM_MB, DEFAULT_DISK_MB)
     try:
         await _create_overlay(new_vm_id, DEFAULT_DISK_MB)
+        await _ensure_tap(new_vm_id)
         pid = await _launch_firecracker(new_vm_id, DEFAULT_VCPU, DEFAULT_MEM_MB)
         _vm_state.update(new_vm_id, {"pid": pid, "status": "booting"})
         if not await _wait_for_agent(new_vm_id, timeout=45):
@@ -1344,6 +1399,7 @@ async def api_vm_create(params: VMCreateInput):
 
     try:
         await _create_overlay(vm_id, params.disk_mb)
+        await _ensure_tap(vm_id)
         pid = await _launch_firecracker(vm_id, params.vcpu, params.mem_mb)
         _vm_state.update(vm_id, {"pid": pid, "status": "booting"})
         ready = await _wait_for_agent(vm_id, timeout=45)
@@ -1517,6 +1573,8 @@ async def api_vm_resume(vm_id: str):
         if vsock.exists():
             vsock.unlink()
 
+        await _ensure_tap(vm_id)  # tap may be gone if the host rebooted; recreate before FC starts
+
         fc_proc = subprocess.Popen(
             [FC_BINARY, "--api-sock", socket, "--level", "Warning"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1577,6 +1635,7 @@ async def api_vm_destroy(vm_id: str):
     _vm_state.delete(vm_id)
     _session_map.remove(vm_id)
     await _s3_delete_vm(vm_id)  # no-op when S3 disabled; removes the archive otherwise
+    await _release_tap(vm_id)   # on-demand tap lifecycle: delete the device on destroy
     _rebuild_egress_index()  # drop this VM's ip->policy entry so a reused slot can't inherit it
     return {"vm_id": vm_id, "name": record["name"], "status": "destroyed"}
 
@@ -1666,7 +1725,7 @@ def _ip_of_record(record: Dict) -> Optional[str]:
     if record.get("ip_address"):
         return record["ip_address"]
     slot = _record_slot(record)
-    return f"172.16.0.{slot}" if slot is not None else None
+    return _slot_to_ip(slot) if slot is not None else None
 
 
 def _build_egress_index(vm_records: List[Dict], sessions: List[Dict]) -> Dict[str, Dict]:
@@ -1791,6 +1850,7 @@ async def _create_and_boot_vm(name: str, vcpu: int, mem_mb: int, disk_mb: int) -
     await _allocate_and_create_record(vm_id, name, vcpu, mem_mb, disk_mb)
     try:
         await _create_overlay(vm_id, disk_mb)
+        await _ensure_tap(vm_id)
         pid = await _launch_firecracker(vm_id, vcpu, mem_mb)
         _vm_state.update(vm_id, {"pid": pid, "status": "booting"})
         if not await _wait_for_agent(vm_id, timeout=45):

@@ -36,12 +36,13 @@ def test_slot_stability_across_destroy_recreate():
 
 
 def test_slot_capacity_cap():
+    cap = server.SLOT_MAX - server.SLOT_MIN + 1
     server._slots.rebuild_from_records([])
-    got = [server._slots.allocate() for _ in range(server.SLOT_MAX - server.SLOT_MIN + 1)]
-    assert None not in got and len(set(got)) == 32, got
-    assert server._slots.allocate() is None  # 33rd allocation refused
+    got = [server._slots.allocate() for _ in range(cap)]
+    assert None not in got and len(set(got)) == cap, got
+    assert server._slots.allocate() is None  # cap+1 allocation refused
     assert server._slots.free_count() == 0
-    print("PASS: allocator caps at 32 slots and refuses the 33rd")
+    print(f"PASS: allocator caps at {cap} slots and refuses the next one")
 
 
 def test_legacy_record_slot_derivation():
@@ -76,8 +77,9 @@ def test_reconcile_classifies_and_rebuilds_freelist(monkeyish):
     assert server._vm_state.get("vm-live")["status"] == "running"
     assert server._vm_state.get("vm-paused")["status"] == "paused"
     assert server._vm_state.get("vm-dead")["status"] == "error"
-    # All three survivors keep their slots reserved -> 3 used, 29 free.
-    assert server._slots.free_count() == 29, server._slots.free_count()
+    # All three survivors keep their slots reserved -> 3 used, cap-3 free.
+    cap = server.SLOT_MAX - server.SLOT_MIN + 1
+    assert server._slots.free_count() == cap - 3, server._slots.free_count()
     assert server._ready is True
     print("PASS: reconcile classifies running/paused/error and rebuilds the free-list")
 

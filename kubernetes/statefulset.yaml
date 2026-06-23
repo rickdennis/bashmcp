@@ -86,7 +86,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: FC_MAX_VMS
-              value: "32"            # must match the tap count in setup-network.sh
+              value: "500"           # taps created on-demand; raise up to 65533 (172.16.0.0/16)
             - name: FC_IDLE_PAUSE_SECONDS
               value: "300"           # snapshot+pause VMs idle >5min (frees RAM/CPU); next exec auto-resumes
             - name: FC_EGRESS_ENABLED  # install egress CA into VMs + secretless clone + write egress-index.json
