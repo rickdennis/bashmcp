@@ -135,3 +135,14 @@ Interactive docs at `http://<host>:8080/docs`
 ## Kubernetes
 
 `deployment.yaml` deploys to namespace `fc-mcp`. Requires nodes labeled `fc-mcp=true`, `hostNetwork: true` (for tap device visibility), and `privileged: true`. Uses an initContainer to run `setup-network.sh` before the main server starts. Single replica only — VMs are local to the host they run on.
+
+## AgentCore Variant (`agentcore/`)
+
+`agentcore/` is a self-contained port of this project to **Amazon Bedrock AgentCore**: a FastMCP
+broker (`bash_exec` + `sandbox_*` tools) that drives per-user sandbox sessions on an AgentCore
+runtime via `InvokeAgentRuntimeCommand`, with `/mnt/workspace` persisted by session storage.
+Deployment is GitOps across sr-es-devops repos (broker on eks-devops-nonprod behind the Runlayer
+PrivateLink shim, sandbox runtime in devops-live); see `agentcore/README.md`. It is its own uv
+project; the Firecracker code above is untouched. `agentcore/deploy/standalone/` is the boto3
+path with `--dry-run`; **never apply anything to AWS without Rick's go-ahead** (target account
+sr-es-devops-nonprod, us-east-1).
