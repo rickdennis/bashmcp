@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build and push the bashmcp images. Default target is the firm's mgmt-account ECR
-# (devops/bashmcp-*); the standalone path can point at another registry.
+# Build and push the bashmcp images. Default target is the sr-es-devops-nonprod ECR
+# (devops/bashmcp-*, created by devops-live us-east-1/nonprod/bashmcp-agentcore.tf).
 #
 #   bash deploy/build_push.sh --tag 0.1.0                 # both images
 #   bash deploy/build_push.sh --tag 0.1.0 --sandbox-only  # arm64 only (AgentCore requirement)
@@ -12,7 +12,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-REGISTRY="${ECR_REGISTRY:-400566821654.dkr.ecr.us-east-1.amazonaws.com}"
+REGISTRY="${ECR_REGISTRY:-558885799623.dkr.ecr.us-east-1.amazonaws.com}"
 SANDBOX_REPO="${SANDBOX_REPO:-devops/bashmcp-sandbox}"
 BROKER_REPO="${BROKER_REPO:-devops/bashmcp-broker}"
 REGION="us-east-1"

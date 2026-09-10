@@ -59,26 +59,25 @@ EdDSA, tenant JWKS) and takes the caller's email from it.
 
 | Repo / branch | Contents |
 |---|---|
-| ECR (see note) | repositories `devops/bashmcp-sandbox`, `devops/bashmcp-broker` in the mgmt account |
-| `devops-live` `bashmcp-agentcore` | `us-east-1/nonprod/bashmcp-agentcore.tf`: sandbox runtime `bashmcp_sandbox_nonprod`, execution role, DynamoDB `bashmcp-sandboxes`; image tag in `bashmcp.auto.tfvars.json` |
-| `admin-live` `bashmcp-broker-irsa` | `accounts/sr-es-devops-nonprod/us-east-1/nonprod/iam_bashmcp_broker.tf`: IRSA role `bashmcp-broker-nonprod` |
+| `devops-live` `bashmcp-agentcore` | `us-east-1/nonprod/bashmcp-agentcore.tf`: ECR `devops/bashmcp-sandbox` + `devops/bashmcp-broker`, DynamoDB `bashmcp-sandboxes`, IRSA role `bashmcp-broker-nonprod`, sandbox runtime `bashmcp_sandbox_nonprod` (gated by `bashmcp-sandbox-enabled`); image tag in `bashmcp.auto.tfvars.json` |
 | `k8s-devops` `bashmcp-broker` | `apps/bashmcp/us-east-1/nonprod/bashmcp.yaml` + `appsets-nonprod/bashmcp.yaml`: Deployment, SA, HTTPRoutes on `eg` and `eg-privatelink`, health check |
 | `runlayer-shims-live` `bashmcp-shim` (local) | `environments/nonprod/bashmcp.yaml`: passthrough shim on the `mcp-test-nonprod` PrivateLink connection |
 
 Rollout order (each step is a PR; `devops-live` applies on merge to master):
 
-1. Create the two ECR repositories (`ecr-live` is archived; see the note in this repo's
-   GitOps summary), then `bash deploy/build_push.sh --tag 0.1.0` (pushes `devops/bashmcp-sandbox`
-   arm64 and `devops/bashmcp-broker` multi-arch to the mgmt ECR).
-2. `devops-live` PR (plan appears on the PR; merge applies). Verify with
-   `uv run deploy/probe_sandbox.py --name bashmcp_sandbox_nonprod` using your own credentials.
-3. `admin-live` PR (IRSA role), then `k8s-devops` PR (ArgoCD syncs; check `/healthz` on
+1. `devops-live` PR with `bashmcp-sandbox-enabled: false` (plan appears on the PR; merge
+   applies): ECR repos, DynamoDB table, IRSA role.
+2. `bash deploy/build_push.sh --tag 0.1.0` pushes `devops/bashmcp-sandbox` (arm64) and
+   `devops/bashmcp-broker` (multi-arch) to the nonprod-account ECR (tags are immutable).
+3. Follow-up `devops-live` PR flipping `bashmcp-sandbox-enabled` to `true` creates the runtime.
+   Verify with `uv run deploy/probe_sandbox.py --name bashmcp_sandbox_nonprod`.
+4. `k8s-devops` PR (ArgoCD syncs; check `/healthz` on
    `https://bashmcp.stoneridgeam-nonprod.cloud/healthz` from inside the VPC).
-4. `runlayer-shims-live`: run `uvx runlayer deploy init` once, paste the UUID into the YAML, PR;
+5. `runlayer-shims-live`: run `uvx runlayer deploy init` once, paste the UUID into the YAML, PR;
    merge deploys and registers the connector. Enable **Identity Forward (signed token)** on
    the connector, grant access with `src/scripts/access.sh`, then set `RUNLAYER_AUDIENCE` to
    `runlayer:identity-forward:<connector-id>` in the k8s manifest.
-5. `claude mcp add --transport http bashmcp https://stoneridge.runlayer.com/api/v1/proxy/<connector-id>/mcp`
+6. `claude mcp add --transport http bashmcp https://stoneridge.runlayer.com/api/v1/proxy/<connector-id>/mcp`
    and ask Claude Code to run something.
 
 Broker environment: `AUTH_MODE=runlayer`, `RUNLAYER_URL`, optional `RUNLAYER_AUDIENCE`,
