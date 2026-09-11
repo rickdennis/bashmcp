@@ -31,7 +31,8 @@ Claude Code ──► Runlayer connector (manual OAuth 2.1 → Cognito, per-user
 broker/     FastMCP server: bash_exec, sandbox_list/status/pause/new/destroy  (+ Dockerfile)
 sandbox/    Ubuntu 24.04 image with dev tools + a no-op AgentCore entrypoint  (+ Dockerfile)
 runlayer.yaml  Runlayer Deploy manifest for the broker (hosting A)
-deploy/     build_push.sh, probe_sandbox.py, _common.py; standalone/ = original boto3 + Cognito path
+deploy/     build_push.sh, probe_sandbox.py, list_sandboxes.py, _common.py; standalone/ = original boto3 + Cognito path
+ui/         local operator web UI (127.0.0.1): all sandboxes, runtime status, recent commands, exec/pause
 smoke.py    end-to-end test against the deployed broker
 ```
 
@@ -169,6 +170,11 @@ unless the model passes `workspace` explicitly (a project instruction is the rel
 - **Audit:** CloudTrail records every `InvokeAgentRuntimeCommand`; the sandbox's CloudWatch log
   group (`/aws/bedrock-agentcore/runtimes/bashmcp_sandbox-*`) records the command text; the
   broker logs user, workspace, exit code and the first 200 chars of each command.
+- **Operator view:** AgentCore has no session-list API, so the DynamoDB registry is the source of
+  truth. `uv run deploy/list_sandboxes.py` prints it; `uv run ui/app.py --profile <profile>` serves a
+  local web UI on http://127.0.0.1:8787 that also shows the runtime status, the recent-command feed
+  from CloudWatch, and lets you run a command in or pause any user's sandbox with your own AWS
+  credentials (root inside their microVM; every call is in CloudTrail). See `ui/README.md`.
 - **Cost:** microVM CPU $0.0895/vCPU-h while busy plus $0.00945/GB-h of peak memory while the
   session is up (idle-but-not-stopped bills memory only). Session storage pricing is TBD (preview).
 

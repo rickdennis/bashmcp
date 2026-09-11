@@ -12,6 +12,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "fastapi>=0.141.1",  # local operator UI (ui/app.py) only; not shipped in the broker image
     "httpx>=0.28",
     "moto[dynamodb]>=5.0",
     "pytest>=8.3",

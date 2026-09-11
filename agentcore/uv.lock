@@ -7,6 +7,15 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "annotated-doc"
+version = "0.0.5"
+source = { registry = "https://artifactory.stoneridgeam.com/artifactory/api/pypi/pypi-am-shared-noenv-virtual/simple" }
+sdist = { url = "https://artifactory.stoneridgeam.com/artifactory/api/pypi/pypi-am-shared-noenv-virtual/packages/packages/5a/8e/38aa427ed5402449e226975b649c5dc73ccadfefeb95e6aecb8f8ea4b6b6/annotated_doc-0.0.5.tar.gz", hash = "sha256:c7e58ce09192557605d8bbd92836d7e1d520ac9580096042c0bfd197efacf1bb" }
+wheels = [
+    { url = "https://artifactory.stoneridgeam.com/artifactory/api/pypi/pypi-am-shared-noenv-virtual/packages/packages/3e/30/e900b21425a860e195f32e37657aa1f7c7f2b1bfb26f03ca209b90933c06/annotated_doc-0.0.5-py3-none-any.whl", hash = "sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101" },
+]
+
+[[package]]
 name = "annotated-types"
 version = "0.8.0"
 source = { registry = "https://artifactory.stoneridgeam.com/artifactory/api/pypi/pypi-am-shared-noenv-virtual/simple" }
@@ -50,6 +59,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "fastapi" },
     { name = "httpx" },
     { name = "moto", extra = ["dynamodb"] },
     { name = "pytest" },
@@ -66,6 +76,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "fastapi", specifier = ">=0.141.1" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "moto", extras = ["dynamodb"], specifier = ">=5.0" },
     { name = "pytest", specifier = ">=8.3" },
@@ -405,6 +416,22 @@ dependencies = [
 sdist = { url = "https://artifactory.stoneridgeam.com/artifactory/api/pypi/pypi-am-shared-noenv-virtual/packages/packages/88/7f/731ff914b0255d3d065f45fd4e626d4b8c95dbcbaada049f337a6ac16410/docker-7.2.0.tar.gz", hash = "sha256:cebb93773d334f778e023a7ee352a8d6e13ab1bd3b863a4d4a59dec897df43ac" }
 wheels = [
     { url = "https://artifactory.stoneridgeam.com/artifactory/api/pypi/pypi-am-shared-noenv-virtual/packages/packages/75/23/529140fe1aab80fc6992f93a706deec709140a6397439139a054e1515c45/docker-7.2.0-py3-none-any.whl", hash = "sha256:a3f45fdeb9165e2d25d9a1d02ddf3bc70fb572cf5ebbf9b58558c22caf29b71f" },
+]
+
+[[package]]
+name = "fastapi"
+version = "0.141.1"
+source = { registry = "https://artifactory.stoneridgeam.com/artifactory/api/pypi/pypi-am-shared-noenv-virtual/simple" }
+dependencies = [
+    { name = "annotated-doc" },
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://artifactory.stoneridgeam.com/artifactory/api/pypi/pypi-am-shared-noenv-virtual/packages/packages/8a/02/91e3416a8fdd715abb903a952a6bec7cdd8d14eed55d415fc8595524c319/fastapi-0.141.1.tar.gz", hash = "sha256:e8822fc40db1e1858054d7a949a888695bc9bdce70139178e33bd2871a453ca1" }
+wheels = [
+    { url = "https://artifactory.stoneridgeam.com/artifactory/api/pypi/pypi-am-shared-noenv-virtual/packages/packages/cb/03/10388a42375ee7e4ac9b94eb2c5c569c8b5795e377e701c9ac3ad63de890/fastapi-0.141.1-py3-none-any.whl", hash = "sha256:bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3" },
 ]
 
 [[package]]

@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bashmcp sandboxes</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --panel-2: #f0f2f5;
+    --border: #d8dce3;
+    --text: #1b1f26;
+    --muted: #626b78;
+    --accent: #2f6fed;
+    --accent-text: #ffffff;
+    --warn-bg: #fff3cd;
+    --warn-border: #d9a520;
+    --warn-text: #5c4400;
+    --ok: #1d8f4e;
+    --paused: #9a6b00;
+    --stopped: #6b7280;
+    --err: #c62f2f;
+    --stderr: #b3401f;
+    --sel: rgba(47, 111, 237, 0.10);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10131a;
+      --panel: #171b24;
+      --panel-2: #1e232e;
+      --border: #2a3140;
+      --text: #e5e8ee;
+      --muted: #97a0af;
+      --accent: #6d9bff;
+      --accent-text: #0b1220;
+      --warn-bg: #3a2e0f;
+      --warn-border: #b8922c;
+      --warn-text: #f6e2a3;
+      --ok: #45c07a;
+      --paused: #e0b64a;
+      --stopped: #8b94a3;
+      --err: #ff6b6b;
+      --stderr: #ff9a6b;
+      --sel: rgba(109, 155, 255, 0.16);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 var(--sans); }
+  body { padding: 16px 20px 40px; max-width: 1600px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  h2 { font-size: 13px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+  a { color: var(--accent); }
+  code, .mono { font-family: var(--mono); font-size: 12.5px; }
+  .muted { color: var(--muted); }
+  .banner {
+    background: var(--warn-bg); border: 1px solid var(--warn-border); color: var(--warn-text);
+    border-left-width: 6px; border-radius: 6px; padding: 10px 14px; margin: 0 0 14px; font-weight: 600;
+  }
+  header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; }
+  .runtime-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px;
+    display: grid; grid-template-columns: auto 1fr; gap: 2px 14px; min-width: 320px; flex: 1 1 520px;
+  }
+  .runtime-card .k { color: var(--muted); }
+  .runtime-card .v { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+  .grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(380px, 1fr); gap: 16px; }
+  @media (max-width: 1050px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .panel + .panel { margin-top: 16px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+  .toolbar .spacer { flex: 1; }
+  input[type=text], input[type=number], textarea, select {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 8px; font: inherit;
+  }
+  textarea { font-family: var(--mono); font-size: 12.5px; width: 100%; min-height: 84px; resize: vertical; }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 12px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button.danger { color: var(--err); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--sel); }
+  tbody tr.selected { background: var(--sel); outline: 1px solid var(--accent); outline-offset: -1px; }
+  td.sid { font-family: var(--mono); font-size: 12px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid currentColor; white-space: nowrap; }
+  .badge.active { color: var(--ok); }
+  .badge.paused { color: var(--paused); }
+  .badge.stopped { color: var(--stopped); }
+  .badge.unknown { color: var(--muted); }
+  .empty { color: var(--muted); padding: 14px 4px; }
+  .sel-info { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin-bottom: 10px; }
+  .sel-info .k { color: var(--muted); }
+  .sel-info .v { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+  .exec-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+  .exec-row label { color: var(--muted); font-size: 12.5px; }
+  .exec-row input[type=text] { flex: 1 1 200px; font-family: var(--mono); font-size: 12.5px; }
+  .exec-row input[type=number] { width: 84px; }
+  .quick { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .quick button { font-family: var(--mono); font-size: 12px; padding: 4px 8px; }
+  pre.output {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 10px;
+    margin: 10px 0 0; min-height: 120px; max-height: 480px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.4;
+  }
+  pre.output .err { color: var(--stderr); }
+  pre.output .sys { color: var(--muted); font-style: italic; }
+  pre.output .fail { color: var(--err); font-weight: 600; }
+  .footer { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 8px; font-size: 12.5px; color: var(--muted); min-height: 18px; }
+  .footer b { color: var(--text); font-weight: 600; }
+  .footer .bad { color: var(--err); }
+  .status-line { font-size: 12.5px; color: var(--muted); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: middle; }
+  .dot.live { background: var(--ok); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  ul.activity { list-style: none; margin: 0; padding: 0; max-height: 520px; overflow: auto; }
+  ul.activity li { padding: 6px 4px; border-bottom: 1px solid var(--border); display: grid; grid-template-columns: 74px 1fr; gap: 10px; }
+  ul.activity .t { color: var(--muted); font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+  ul.activity .c { font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; }
+  ul.activity .c .wd { color: var(--muted); display: block; font-size: 11.5px; }
+  .error-line { color: var(--err); font-size: 12.5px; margin-top: 6px; }
+  kbd { font-family: var(--mono); font-size: 11.5px; border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<div class="banner" id="banner">Operator access: commands run as root inside the selected user's sandbox using your AWS credentials; every call is recorded in CloudTrail.</div>
+
+<header>
+  <div>
+    <h1>bashmcp sandboxes</h1>
+    <div class="status-line" id="status-line">loading…</div>
+  </div>
+  <div class="runtime-card" id="runtime-card">
+    <span class="k">runtime</span><span class="v" id="rt-name">…</span>
+    <span class="k">status</span><span class="v" id="rt-status">…</span>
+    <span class="k">version</span><span class="v" id="rt-version">…</span>
+    <span class="k">ARN</span><span class="v" id="rt-arn">…</span>
+    <span class="k">region / profile</span><span class="v" id="rt-region">…</span>
+    <span class="k">acting as</span><span class="v" id="rt-caller">…</span>
+    <span class="k">log group</span><span class="v" id="rt-log">…</span>
+  </div>
+</header>
+
+<div class="grid">
+  <section>
+    <div class="panel">
+      <div class="toolbar">
+        <h2 style="margin:0">Sandboxes <span class="muted" id="sb-count"></span></h2>
+        <span class="spacer"></span>
+        <input type="text" id="filter" placeholder="filter by user, workspace, state, label, session id…" style="min-width:280px">
+        <button id="refresh-sb" title="reload now">Refresh</button>
+        <span class="muted" id="sb-refreshed"></span>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>User</th><th>Workspace</th><th>State</th><th>Idle</th><th>Created</th><th>Last used</th><th>Runtime session id</th><th>Label</th>
+            </tr>
+          </thead>
+          <tbody id="sb-body"></tbody>
+        </table>
+        <div class="empty" id="sb-empty" hidden>No sandboxes match.</div>
+      </div>
+      <div class="error-line" id="sb-error" hidden></div>
+    </div>
+  </section>
+
+  <aside>
+    <div class="panel" id="detail">
+      <h2>Selected sandbox</h2>
+      <div class="empty" id="detail-empty">Click a row to select a sandbox.</div>
+      <div id="detail-body" hidden>
+        <div class="sel-info">
+          <span class="k">user</span><span class="v" id="d-user"></span>
+          <span class="k">workspace</span><span class="v" id="d-ws"></span>
+          <span class="k">state</span><span class="v" id="d-state"></span>
+          <span class="k">session</span><span class="v" id="d-sid"></span>
+        </div>
+        <textarea id="cmd" placeholder="command (bash -lc, runs as root)…" spellcheck="false"></textarea>
+        <div class="exec-row">
+          <label for="wd">working_dir</label>
+          <input type="text" id="wd" value="/mnt/workspace">
+          <label for="timeout">timeout (s)</label>
+          <input type="number" id="timeout" value="60" min="1" max="600">
+          <button class="primary" id="run">Run</button>
+          <button class="danger" id="pause" title="StopRuntimeSession: the microVM stops, /mnt/workspace is kept, resumes on next exec">Pause</button>
+        </div>
+        <div class="quick">
+          <span class="muted" style="align-self:center">quick:</span>
+          <button data-cmd="id -u; df -h /mnt/workspace">id -u; df -h /mnt/workspace</button>
+          <button data-cmd="ls -la /mnt/workspace">ls -la /mnt/workspace</button>
+        </div>
+        <div class="muted" style="margin-top:6px;font-size:12px"><kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Enter</kbd> runs the command.</div>
+        <pre class="output" id="out"></pre>
+        <div class="footer" id="out-footer"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="toolbar">
+        <h2 style="margin:0">Recent commands</h2>
+        <span class="spacer"></span>
+        <select id="act-minutes">
+          <option value="15">last 15 min</option>
+          <option value="60" selected>last 60 min</option>
+          <option value="240">last 4 h</option>
+          <option value="1440">last 24 h</option>
+        </select>
+        <button id="refresh-act">Refresh</button>
+      </div>
+      <div class="muted" style="font-size:12px;margin-bottom:6px" id="act-meta"></div>
+      <ul class="activity" id="act-list"></ul>
+      <div class="empty" id="act-empty" hidden>No commands in this window.</div>
+      <div class="error-line" id="act-error" hidden></div>
+    </div>
+  </aside>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const UI_HEADER = { "x-bashmcp-ui": "1" };
+  const REFRESH_MS = 15000;
+
+  const state = { sandboxes: [], selected: null, running: false, lastRefresh: null };
+
+  // ---------- helpers ----------
+  function fmtIdle(s) {
+    if (s === null || s === undefined) return "?";
+    if (s < 60) return s + "s";
+    const m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+    if (d > 0) return d + "d " + (h % 24) + "h";
+    if (h > 0) return h + "h " + (m % 60) + "m";
+    return m + "m";
+  }
+  function fmtTime(iso) {
+    if (!iso) return "?";
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+    return d.toLocaleString(undefined, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  }
+  function fmtClock(iso) {
+    const d = new Date(iso);
+    return isNaN(d) ? "?" : d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+  function badgeClass(stateName) {
+    if (stateName === "active") return "active";
+    if (stateName === "paused") return "paused";
+    if (stateName === "likely stopped") return "stopped";
+    return "unknown";
+  }
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+  function setText(id, text) { $(id).textContent = text === null || text === undefined || text === "" ? "—" : text; }
+  async function getJSON(url) {
+    const r = await fetch(url, { cache: "no-store" });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || body.detail || (r.status + " " + r.statusText));
+    return body;
+  }
+
+  // ---------- runtime card ----------
+  async function loadRuntime() {
+    try {
+      const rt = await getJSON("/api/runtime");
+      setText("rt-name", rt.name + "  (" + rt.id + ")");
+      setText("rt-status", (rt.status || "unknown") + (rt.error ? "  — " + rt.error : ""));
+      setText("rt-version", rt.version ? "v" + rt.version + (rt.last_updated ? "  updated " + fmtTime(rt.last_updated) : "") : null);
+      setText("rt-arn", rt.arn);
+      setText("rt-region", rt.region + "  /  " + (rt.profile || "default credential chain"));
+      setText("rt-caller", rt.caller_arn);
+      setText("rt-log", rt.log_group);
+      document.title = "bashmcp sandboxes — " + rt.name;
+    } catch (e) {
+      setText("rt-status", "error: " + e.message);
+    }
+  }
+
+  // ---------- sandboxes table ----------
+  function matchesFilter(row, q) {
+    if (!q) return true;
+    const hay = [row.user_email, row.user_name, row.user_sub, row.workspace, row.state, row.label, row.runtime_session_id]
+      .filter(Boolean).join(" ").toLowerCase();
+    return q.split(/\s+/).every((w) => hay.includes(w));
+  }
+  function renderTable() {
+    const q = $("filter").value.trim().toLowerCase();
+    const body = $("sb-body");
+    body.textContent = "";
+    let shown = 0;
+    for (const row of state.sandboxes) {
+      if (!matchesFilter(row, q)) continue;
+      shown++;
+      const tr = el("tr");
+      tr.dataset.sid = row.runtime_session_id;
+      if (state.selected && state.selected.runtime_session_id === row.runtime_session_id) tr.classList.add("selected");
+      const user = el("td", null, row.user_email || row.user_name || row.user_sub || "?");
+      if (row.user_email && row.user_sub) user.title = row.user_sub;
+      tr.appendChild(user);
+      tr.appendChild(el("td", "mono", row.workspace));
+      const st = el("td"); st.appendChild(el("span", "badge " + badgeClass(row.state), row.state)); tr.appendChild(st);
+      const idle = el("td", null, fmtIdle(row.idle_seconds)); idle.title = row.last_used_at || ""; tr.appendChild(idle);
+      const cr = el("td", null, fmtTime(row.created_at)); cr.title = row.created_at || ""; tr.appendChild(cr);
+      const lu = el("td", null, fmtTime(row.last_used_at)); lu.title = row.last_used_at || ""; tr.appendChild(lu);
+      const sid = el("td", "sid", row.runtime_session_id); tr.appendChild(sid);
+      tr.appendChild(el("td", null, row.label || ""));
+      tr.addEventListener("click", () => select(row.runtime_session_id));
+      body.appendChild(tr);
+    }
+    $("sb-empty").hidden = shown > 0;
+    $("sb-count").textContent = shown === state.sandboxes.length ? "(" + shown + ")" : "(" + shown + " of " + state.sandboxes.length + ")";
+  }
+  async function loadSandboxes() {
+    try {
+      const data = await getJSON("/api/sandboxes");
+      state.sandboxes = data.sandboxes || [];
+      state.lastRefresh = new Date();
+      $("sb-error").hidden = true;
+      // keep the selection in sync with fresh data
+      if (state.selected) {
+        const fresh = state.sandboxes.find((r) => r.runtime_session_id === state.selected.runtime_session_id);
+        if (fresh) { state.selected = fresh; renderDetail(); }
+      }
+      renderTable();
+      $("status-line").textContent = data.count + " sandbox(es) in " + data.table + "; state inferred with a " + Math.round(data.idle_seconds / 60) + " min idle timeout; auto-refresh every 15 s";
+    } catch (e) {
+      $("sb-error").textContent = "could not load sandboxes: " + e.message;
+      $("sb-error").hidden = false;
+    }
+    $("sb-refreshed").textContent = state.lastRefresh ? "refreshed " + fmtClock(state.lastRefresh.toISOString()) : "";
+  }
+
+  // ---------- detail / exec ----------
+  function select(sid) {
+    state.selected = state.sandboxes.find((r) => r.runtime_session_id === sid) || null;
+    renderTable();
+    renderDetail();
+    if (state.selected) $("cmd").focus();
+  }
+  function renderDetail() {
+    const row = state.selected;
+    $("detail-empty").hidden = !!row;
+    $("detail-body").hidden = !row;
+    if (!row) return;
+    setText("d-user", row.user_email || row.user_name || row.user_sub);
+    setText("d-ws", row.workspace + (row.label ? "  (" + row.label + ")" : ""));
+    setText("d-state", row.state + "  · idle " + fmtIdle(row.idle_seconds) + "  · registry status " + (row.status || "?"));
+    setText("d-sid", row.runtime_session_id);
+  }
+  function appendOut(text, cls) {
+    if (!text) return;
+    const out = $("out");
+    const span = el("span", cls || null, text);
+    out.appendChild(span);
+    out.scrollTop = out.scrollHeight;
+  }
+  function setFooter(parts) {
+    const f = $("out-footer");
+    f.textContent = "";
+    for (const [k, v, bad] of parts) {
+      const s = el("span", bad ? "bad" : null);
+      s.appendChild(document.createTextNode(k + " "));
+      const b = el("b", null, String(v));
+      s.appendChild(b);
+      f.appendChild(s);
+    }
+  }
+  async function readSSE(resp, onEvent) {
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        let ev = "message", data = "";
+        for (const line of block.split("\n")) {
+          if (line.startsWith("event:")) ev = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trim();
+        }
+        let parsed = {};
+        try { parsed = data ? JSON.parse(data) : {}; } catch (_) { parsed = { raw: data }; }
+        onEvent(ev, parsed);
+      }
+    }
+  }
+  async function runCommand() {
+    const row = state.selected;
+    if (!row || state.running) return;
+    const command = $("cmd").value;
+    if (!command.trim()) { $("cmd").focus(); return; }
+    const timeout = parseInt($("timeout").value, 10);
+    const working_dir = $("wd").value.trim() || "/mnt/workspace";
+    state.running = true;
+    $("run").disabled = true; $("pause").disabled = true;
+    const out = $("out");
+    out.textContent = "";
+    appendOut("$ " + command.replace(/\n/g, "\n  ") + "\n", "sys");
+    setFooter([["status", "starting…"]]);
+    const t0 = performance.now();
+    let sawDone = false;
+    try {
+      const resp = await fetch("/api/exec", {
+        method: "POST",
+        headers: Object.assign({ "Content-Type": "application/json" }, UI_HEADER),
+        body: JSON.stringify({ runtime_session_id: row.runtime_session_id, command, working_dir, timeout }),
+      });
+      if (!resp.ok || !resp.headers.get("content-type") || !resp.headers.get("content-type").startsWith("text/event-stream")) {
+        const body = await resp.json().catch(() => ({}));
+        const detail = typeof body.detail === "object" ? JSON.stringify(body.detail) : (body.detail || body.error || (resp.status + " " + resp.statusText));
+        appendOut("error: " + detail + "\n", "fail");
+        setFooter([["status", "rejected", true]]);
+        return;
+      }
+      await readSSE(resp, (ev, data) => {
+        if (ev === "start") {
+          appendOut("[started in " + data.working_dir + ", timeout " + data.timeout + "s; a cold microVM can take 10-60 s]\n", "sys");
+          setFooter([["status", "running"], ["elapsed", "0s"]]);
+        } else if (ev === "heartbeat") {
+          setFooter([["status", "running"], ["elapsed", data.elapsed_seconds + "s"]]);
+        } else if (ev === "stdout") {
+          appendOut(data.data, null);
+        } else if (ev === "stderr") {
+          appendOut(data.data, "err");
+        } else if (ev === "done") {
+          sawDone = true;
+          const bad = data.exit_code !== 0 || data.status !== "COMPLETED";
+          const parts = [["exit", data.exit_code === null ? "none" : data.exit_code, bad], ["status", data.status, bad], ["elapsed", data.elapsed_seconds + "s"], ["attempts", data.attempts]];
+          if (data.wait_seconds) parts.push(["waited for microVM", data.wait_seconds + "s"]);
+          setFooter(parts);
+        } else if (ev === "error") {
+          sawDone = true;
+          appendOut("error " + data.code + ": " + data.message + "\n", "fail");
+          setFooter([["status", "error", true], ["code", data.code, true], ["elapsed", data.elapsed_seconds + "s"]]);
+        }
+      });
+      if (!sawDone) {
+        appendOut("[stream ended without a done event]\n", "fail");
+        setFooter([["status", "incomplete", true], ["elapsed", ((performance.now() - t0) / 1000).toFixed(1) + "s"]]);
+      }
+    } catch (e) {
+      appendOut("request failed: " + e.message + "\n", "fail");
+      setFooter([["status", "failed", true]]);
+    } finally {
+      state.running = false;
+      $("run").disabled = false; $("pause").disabled = false;
+      loadSandboxes();
+    }
+  }
+  async function pauseSelected() {
+    const row = state.selected;
+    if (!row || state.running) return;
+    const who = (row.user_email || row.user_sub) + " / " + row.workspace;
+    if (!window.confirm("Pause (StopRuntimeSession) the sandbox " + who + "?\n\nThe microVM stops now; /mnt/workspace is kept and the sandbox resumes on its next bash_exec.")) return;
+    $("pause").disabled = true; $("run").disabled = true;
+    try {
+      const r = await fetch("/api/pause", {
+        method: "POST",
+        headers: Object.assign({ "Content-Type": "application/json" }, UI_HEADER),
+        body: JSON.stringify({ runtime_session_id: row.runtime_session_id }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const detail = typeof body.detail === "object" ? JSON.stringify(body.detail) : (body.detail || body.error || r.statusText);
+        appendOut("pause failed: " + detail + "\n", "fail");
+      } else {
+        appendOut("[pause -> " + body.result + "; registry status set to paused]\n", "sys");
+      }
+    } catch (e) {
+      appendOut("pause request failed: " + e.message + "\n", "fail");
+    } finally {
+      $("pause").disabled = false; $("run").disabled = false;
+      loadSandboxes();
+    }
+  }
+
+  // ---------- activity ----------
+  async function loadActivity() {
+    const minutes = $("act-minutes").value;
+    $("refresh-act").disabled = true;
+    try {
+      const data = await getJSON("/api/activity?minutes=" + encodeURIComponent(minutes) + "&limit=100");
+      const list = $("act-list");
+      list.textContent = "";
+      for (const ev of data.events || []) {
+        const li = el("li");
+        const t = el("span", "t", fmtClock(ev.time)); t.title = ev.time + (ev.request_id ? "\nrequest " + ev.request_id : "") + (ev.log_stream ? "\nstream " + ev.log_stream : "");
+        li.appendChild(t);
+        const c = el("span", "c", ev.command);
+        if (ev.working_dir && ev.working_dir !== "/mnt/workspace") c.appendChild(el("span", "wd", "in " + ev.working_dir));
+        li.appendChild(c);
+        list.appendChild(li);
+      }
+      $("act-empty").hidden = (data.events || []).length > 0;
+      $("act-error").hidden = !data.error;
+      $("act-error").textContent = data.error || "";
+      $("act-meta").textContent = (data.events || []).length + " command(s) in " + data.log_group + " (newest first, cap 100)";
+    } catch (e) {
+      $("act-error").textContent = "could not load activity: " + e.message;
+      $("act-error").hidden = false;
+    } finally {
+      $("refresh-act").disabled = false;
+    }
+  }
+
+  // ---------- wiring ----------
+  $("filter").addEventListener("input", renderTable);
+  $("refresh-sb").addEventListener("click", loadSandboxes);
+  $("refresh-act").addEventListener("click", loadActivity);
+  $("act-minutes").addEventListener("change", loadActivity);
+  $("run").addEventListener("click", runCommand);
+  $("pause").addEventListener("click", pauseSelected);
+  $("cmd").addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); runCommand(); }
+  });
+  for (const b of document.querySelectorAll(".quick button")) {
+    b.addEventListener("click", () => { $("cmd").value = b.dataset.cmd; runCommand(); });
+  }
+
+  loadRuntime();
+  loadSandboxes();
+  loadActivity();
+  setInterval(loadSandboxes, REFRESH_MS);
+  setInterval(loadRuntime, 60000);
+})();
+</script>
+</body>
+</html>
