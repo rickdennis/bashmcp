@@ -20,7 +20,7 @@ export SANDBOX_RUNTIME_NAME="${SANDBOX_RUNTIME_NAME:-bashmcp_sandbox_nonprod}"
 export SANDBOX_TABLE="${SANDBOX_TABLE:-bashmcp-sandboxes}"
 export MAX_TIMEOUT="${MAX_TIMEOUT:-600}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
-PORT="${PORT:-8000}"
+PORT=8000  # the broker always binds 8000
 DEV_USER="${DEV_USER:-$(whoami)}"
 
 TOKEN="$(python3 - "$DEV_USER" "$EXPECTED_ISSUER" <<'PY'
