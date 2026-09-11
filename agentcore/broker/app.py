@@ -6,6 +6,7 @@ AgentCore: one persistent sandbox session per (caller, workspace).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -131,9 +132,38 @@ mcp = FastMCP(
 _logged_first_request = False
 
 
+_REDACT = {"authorization", "x-runlayer-identity-token", "cookie", "proxy-authorization"}
+
+
+def _fingerprint(ctx: Context, headers) -> None:
+    """Temporary diagnostic (LOG_REQUEST_FINGERPRINT=1): every header value except credentials,
+    plus whatever the MCP layer knows about the client, to see if anything identifies a session."""
+    shown = {}
+    for k, v in headers.items():
+        lk = k.lower()
+        shown[lk] = f"<redacted {len(v)} chars>" if lk in _REDACT else v
+    client = None
+    try:
+        params = ctx.session.client_params
+        if params is not None:
+            client = {"clientInfo": params.clientInfo.model_dump() if params.clientInfo else None,
+                      "protocolVersion": params.protocolVersion}
+    except Exception as exc:  # noqa: BLE001 - diagnostic only
+        client = f"unavailable: {type(exc).__name__}"
+    meta = None
+    try:
+        meta = ctx.request_context.meta.model_dump() if ctx.request_context.meta else None
+    except Exception:  # noqa: BLE001
+        pass
+    log.info("FINGERPRINT headers=%s mcp_client=%s request_meta=%s request_id=%s",
+             json.dumps(shown, sort_keys=True), client, meta, getattr(ctx.request_context, "request_id", None))
+
+
 def _identity(ctx: Context) -> Identity:
     global _logged_first_request
     headers = headers_from_context(ctx)
+    if os.environ.get("LOG_REQUEST_FINGERPRINT"):
+        _fingerprint(ctx, headers)
     if not _logged_first_request:
         # Once per process: which headers the proxy in front of us forwards (names only, never
         # values) and the proxy's request timeout, which bounds how long bash_exec may run.
