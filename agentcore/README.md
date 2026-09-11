@@ -65,7 +65,7 @@ No EKS, no PrivateLink, no IRSA, no shim.
 
 | Where | What |
 |---|---|
-| `devops-live` `us-east-1/nonprod/bashmcp-agentcore.tf` | ECR repos, DynamoDB `bashmcp-sandboxes`, sandbox runtime `bashmcp_sandbox_nonprod`, IAM roles (IRSA for EKS; Runlayer-trusted role gated on `bashmcp-runlayer-deployment-id`) |
+| `devops-live` `us-east-1/nonprod/bashmcp-agentcore.tf` | ECR repos, DynamoDB `bashmcp-sandboxes`, sandbox runtime `bashmcp_sandbox_nonprod`, sandbox execution role, Runlayer-trusted broker role (gated on `bashmcp-runlayer-deployment-id`) |
 | this directory | `runlayer.yaml` (deployment manifest), `broker/` (image), `deploy/build_push.sh`, `deploy/probe_sandbox.py` |
 
 1. `uvx runlayer login --host https://stoneridge.runlayer.com`, then
@@ -80,13 +80,12 @@ No EKS, no PrivateLink, no IRSA, no shim.
 5. `claude mcp add --transport http bashmcp https://stoneridge.runlayer.com/api/v1/proxy/<connector-id>/mcp`
    and ask Claude Code to run something.
 
-### B. Broker on eks-devops-nonprod behind the PrivateLink shim (deployed first, works)
+### B. Broker on EKS behind a PrivateLink shim (retired 2026-09-11)
 
-`k8s-devops` `apps/bashmcp/us-east-1/nonprod` (Deployment, HTTPRoutes on `eg` and `eg-privatelink`)
-plus a passthrough shim in `runlayer-shims-live` `environments/nonprod/bashmcp.yaml`. Identity
-arrives the same way; AWS access is the IRSA role `bashmcp-broker-nonprod`. Costs an EKS app,
-the PrivateLink path (350 s NLB idle limit, so `MAX_TIMEOUT=300`), and the shim. Retire it once A
-is live: delete the k8s app and the IRSA role in follow-up PRs.
+The first working deployment ran the broker on eks-devops-nonprod behind the mcp-server
+PrivateLink and a passthrough Runlayer shim, with the IRSA role `bashmcp-broker-nonprod`. It
+worked, but cost an EKS app, the PrivateLink path (350 s NLB idle limit), and a shim. It was
+retired once A was verified; the manifests live in k8s-devops history (PR #244) if ever needed.
 
 Broker environment: `AUTH_MODE=runlayer`, `RUNLAYER_URL`, optional `RUNLAYER_AUDIENCE`,
 optional `BROKER_SHARED_BEARER`, `SANDBOX_RUNTIME_NAME` (resolved to an ARN at startup) or

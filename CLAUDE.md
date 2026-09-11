@@ -141,8 +141,9 @@ Interactive docs at `http://<host>:8080/docs`
 `agentcore/` is a self-contained port of this project to **Amazon Bedrock AgentCore**: a FastMCP
 broker (`bash_exec` + `sandbox_*` tools) that drives per-user sandbox sessions on an AgentCore
 runtime via `InvokeAgentRuntimeCommand`, with `/mnt/workspace` persisted by session storage.
-Deployment is GitOps across sr-es-devops repos (broker on eks-devops-nonprod behind the Runlayer
-PrivateLink shim, sandbox runtime in devops-live); see `agentcore/README.md`. It is its own uv
+Deployment: the broker runs on Runlayer Deploy (`agentcore/runlayer.yaml`, assumes an IAM role in
+the nonprod account); the sandbox runtime, registry table and roles are Terraform in devops-live
+`us-east-1/nonprod/bashmcp-agentcore.tf`; see `agentcore/README.md`. It is its own uv
 project; the Firecracker code above is untouched. `agentcore/deploy/standalone/` is the boto3
 path with `--dry-run`; **never apply anything to AWS without Rick's go-ahead** (target account
 sr-es-devops-nonprod, us-east-1).
