@@ -116,6 +116,37 @@ uv sync
 uv run pytest -q
 ```
 
+## Choosing a workspace (per machine, per project, per person)
+
+The broker keys sandboxes by **Runlayer user** and a **workspace name**. Nothing that reaches the
+broker identifies a Claude conversation (verified exhaustively: Anthropic's `traceparent` scopes one
+assistant turn, Runlayer's ids scope one call), so the workspace name is the only per-context key.
+It resolves in this order:
+
+1. the `workspace` argument on the tool call (explicit, chosen by you or by the model);
+2. the `X-Bashmcp-Workspace` request header (Runlayer forwards client headers verbatim);
+3. `"default"`.
+
+Claude Code can set the header in its MCP config, which pins a sandbox with no model involvement:
+
+```bash
+# one sandbox per machine (user scope)
+claude mcp add --transport http --scope user bashmcp \
+  https://stoneridge.runlayer.com/api/v1/proxy/105fb9c5-bd09-4ea1-8e31-68bf8f89c7b5/mcp \
+  --header "X-Bashmcp-Workspace: rick-laptop"
+```
+
+```json
+// one sandbox per repo: .mcp.json in the project
+{"mcpServers": {"bashmcp": {"type": "http",
+  "url": "https://stoneridge.runlayer.com/api/v1/proxy/105fb9c5-bd09-4ea1-8e31-68bf8f89c7b5/mcp",
+  "headers": {"X-Bashmcp-Workspace": "${BASHMCP_WORKSPACE:-my-repo}"}}}}
+```
+
+Claude Code's `headersHelper` can also compute the header at connection time (for example from the
+git remote name). claude.ai connectors cannot set custom headers, so web sessions use `default`
+unless the model passes `workspace` explicitly (a project instruction is the reliable way).
+
 ## Operating notes
 
 - **Limits per session:** 2 vCPU / 8 GB, 8 h max microVM lifetime (a new one is provisioned
