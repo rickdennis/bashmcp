@@ -29,6 +29,7 @@ class Settings:
     runlayer_audience: str | None = None
     shared_bearer: str | None = None
     sandbox_runtime_name: str | None = None
+    workspace_header: str = "x-bashmcp-workspace"
 
 
 def _int(name: str, default: int) -> int:
@@ -66,4 +67,5 @@ def load_settings() -> Settings:
         runlayer_audience=os.environ.get("RUNLAYER_AUDIENCE") or None,
         shared_bearer=os.environ.get("BROKER_SHARED_BEARER") or None,
         sandbox_runtime_name=os.environ.get("SANDBOX_RUNTIME_NAME") or None,
+        workspace_header=os.environ.get("WORKSPACE_HEADER", "x-bashmcp-workspace").lower(),
     )

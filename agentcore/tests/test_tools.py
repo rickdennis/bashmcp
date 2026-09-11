@@ -155,3 +155,24 @@ async def test_http_layer_forwards_authorization_header(services, fake_client):
                 "params": {"name": "sandbox_list", "arguments": {}}})
             assert denied.status_code == 200
             assert json.loads(denied.json()["result"]["content"][0]["text"])["error"].startswith("Unauthorized")
+
+
+async def test_workspace_from_client_header(services, fake_client):
+    """Runlayer forwards client headers verbatim; X-Bashmcp-Workspace picks the default sandbox."""
+    hdr_ctx = make_ctx(TOKEN, headers={"x-bashmcp-workspace": "laptop-a"})
+    fake_client.invoke_results = [events("a\n"), events("b\n"), events("c\n")]
+    a = json.loads(await app.bash_exec("echo a", ctx=hdr_ctx))
+    assert a["workspace"] == "laptop-a"
+    # explicit argument beats the header
+    b = json.loads(await app.bash_exec("echo b", ctx=hdr_ctx, workspace="proj"))
+    assert b["workspace"] == "proj"
+    # no header, no argument -> default
+    c = json.loads(await app.bash_exec("echo c", ctx=make_ctx(TOKEN)))
+    assert c["workspace"] == "default"
+    listing = json.loads(await app.sandbox_list(hdr_ctx))
+    assert sorted(s["workspace"] for s in listing["sandboxes"]) == ["default", "laptop-a", "proj"]
+    # management tools resolve the header the same way
+    st = json.loads(await app.sandbox_status(hdr_ctx))
+    assert st["workspace"] == "laptop-a"
+    bad = json.loads(await app.bash_exec("echo x", ctx=make_ctx(TOKEN, headers={"x-bashmcp-workspace": "no spaces!"})))
+    assert "workspace" in bad["error"]

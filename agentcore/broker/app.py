@@ -27,6 +27,7 @@ from .auth import (
     AuthError,
     Identity,
     RunlayerIdentityAuthenticator,
+    get_header,
     headers_from_context,
 )
 from .config import MAX_COMMAND_BYTES, Settings, load_settings
@@ -180,6 +181,17 @@ async def healthz(_request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "service": "bashmcp-broker"})
 
 
+def _workspace(ctx: Context, requested: str | None) -> str:
+    """Explicit tool argument wins; else the client's configured header (Runlayer forwards client
+    headers verbatim, so a Claude Code machine/project can pin its sandbox with
+    `--header "X-Bashmcp-Workspace: <name>"`); else "default"."""
+    if requested:
+        return requested
+    header = get_services().settings.workspace_header
+    value = get_header(headers_from_context(ctx), header)
+    return value.strip() if value and value.strip() else "default"
+
+
 def _not_found(workspace: str) -> str:
     return error_json(
         f"No sandbox named '{workspace}'. Run bash_exec (creates it on first use) or sandbox_new.",
@@ -202,7 +214,7 @@ async def bash_exec(
     ctx: Context,
     working_dir: str | None = None,
     timeout: int = 60,
-    workspace: str = "default",
+    workspace: str | None = None,
 ) -> str:
     """Run a shell command as root inside your persistent sandbox microVM.
 
@@ -212,10 +224,14 @@ async def bash_exec(
             which is the only path that survives a pause.
         working_dir: Directory to cd into first (default /mnt/workspace).
         timeout: Max seconds to wait (default 60; server caps the maximum).
-        workspace: Named sandbox to use (default "default"). Created on first use.
+        workspace: Named sandbox to use. Omit to use the client's configured default
+            (the X-Bashmcp-Workspace header if the MCP client sets one, else "default").
+            Use a stable, human-chosen name such as a project or repo; never an
+            ephemeral id. Created on first use.
 
     Returns:
-        JSON with stdout, stderr, returncode, elapsed_seconds, status and cold_start.
+        JSON with stdout, stderr, returncode, elapsed_seconds, status, cold_start and the
+        workspace actually used.
     """
     svc = get_services()
     settings = svc.settings
@@ -229,6 +245,7 @@ async def bash_exec(
         return error_json(f"command exceeds {MAX_COMMAND_BYTES} bytes")
     if not isinstance(timeout, int) or not 1 <= timeout <= settings.max_timeout:
         return error_json(f"timeout must be between 1 and {settings.max_timeout} seconds")
+    workspace = _workspace(ctx, workspace)
 
     try:
         sandbox, created = await asyncio.to_thread(svc.registry.get_or_create, identity, workspace)
@@ -296,13 +313,14 @@ async def sandbox_list(ctx: Context) -> str:
     name="sandbox_status",
     annotations={"title": "Show one sandbox", "readOnlyHint": True, "openWorldHint": False},
 )
-async def sandbox_status(ctx: Context, workspace: str = "default") -> str:
+async def sandbox_status(ctx: Context, workspace: str | None = None) -> str:
     """Show a sandbox's metadata and whether its microVM has probably been stopped for idleness."""
     svc = get_services()
     try:
         identity = _identity(ctx)
     except AuthError as exc:
         return error_json(f"Unauthorized: {exc}")
+    workspace = _workspace(ctx, workspace)
     row = await asyncio.to_thread(svc.registry.get, identity.sub, workspace)
     if row is None:
         return _not_found(workspace)
@@ -323,13 +341,14 @@ async def sandbox_status(ctx: Context, workspace: str = "default") -> str:
     name="sandbox_pause",
     annotations={"title": "Pause a sandbox", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
 )
-async def sandbox_pause(ctx: Context, workspace: str = "default") -> str:
+async def sandbox_pause(ctx: Context, workspace: str | None = None) -> str:
     """Stop the sandbox's microVM now. /mnt/workspace is kept; processes are not. Resumes on next bash_exec."""
     svc = get_services()
     try:
         identity = _identity(ctx)
     except AuthError as exc:
         return error_json(f"Unauthorized: {exc}")
+    workspace = _workspace(ctx, workspace)
     row = await asyncio.to_thread(svc.registry.get, identity.sub, workspace)
     if row is None:
         return _not_found(workspace)
@@ -365,13 +384,14 @@ async def sandbox_new(ctx: Context, workspace: str, label: str | None = None) ->
     name="sandbox_destroy",
     annotations={"title": "Destroy a sandbox", "readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
 )
-async def sandbox_destroy(ctx: Context, workspace: str = "default") -> str:
+async def sandbox_destroy(ctx: Context, workspace: str | None = None) -> str:
     """Stop the sandbox and forget it. Its storage is reclaimed by AgentCore after 14 idle days."""
     svc = get_services()
     try:
         identity = _identity(ctx)
     except AuthError as exc:
         return error_json(f"Unauthorized: {exc}")
+    workspace = _workspace(ctx, workspace)
     row = await asyncio.to_thread(svc.registry.get, identity.sub, workspace)
     if row is None:
         return _not_found(workspace)
