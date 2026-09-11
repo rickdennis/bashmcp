@@ -18,7 +18,7 @@
 #   uvx runlayer deploy          --config runlayer.yaml --host https://stoneridge.runlayer.com
 # Then in Runlayer: enable Identity Forward "signed identity token" on the connector,
 # grant access, and pin RUNLAYER_AUDIENCE below to runlayer:identity-forward:<connector-id>.
-id: REPLACE-WITH-DEPLOY-INIT-UUID # backend-issued by `deploy init`; never let CI run init
+id: 663d9b76-01f8-4ee3-a921-cafbb3aac6af # backend-issued by `deploy init` 2026-09-11; never let CI run init
 name: bashmcp
 
 runtime: docker
