@@ -128,8 +128,20 @@ mcp = FastMCP(
 )
 
 
+_logged_first_request = False
+
+
 def _identity(ctx: Context) -> Identity:
-    return get_services().authenticator.identify(headers_from_context(ctx))
+    global _logged_first_request
+    headers = headers_from_context(ctx)
+    if not _logged_first_request:
+        # Once per process: which headers the proxy in front of us forwards (names only, never
+        # values) and the proxy's request timeout, which bounds how long bash_exec may run.
+        _logged_first_request = True
+        names = sorted(k.lower() for k in headers.keys())
+        timeout_ms = next((v for k, v in headers.items() if k.lower() == "x-envoy-expected-rq-timeout-ms"), None)
+        log.info("first request: header names=%s proxy_timeout_ms=%s", names, timeout_ms)
+    return get_services().authenticator.identify(headers)
 
 
 @mcp.custom_route("/healthz", methods=["GET"])
