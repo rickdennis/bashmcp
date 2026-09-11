@@ -55,4 +55,3 @@ env:
   MAX_TIMEOUT: "300"
   SANDBOX_IDLE_SECONDS: "1800"
   LOG_LEVEL: INFO
-  LOG_REQUEST_DUMP: "1" # TEMPORARY diagnostic: dump every request (headers redacted of credentials, full JSON-RPC body)
