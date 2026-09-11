@@ -118,16 +118,19 @@ uv run pytest -q
 
 ## Choosing a workspace (per machine, per project, per person)
 
-The broker keys sandboxes by **Runlayer user** and a **workspace name**. Nothing that reaches the
-broker identifies a Claude conversation (verified exhaustively: Anthropic's `traceparent` scopes one
-assistant turn, Runlayer's ids scope one call), so the workspace name is the only per-context key.
-It resolves in this order:
+The broker keys sandboxes by **Runlayer user** and a **workspace name**, never by client or
+conversation, so the same person moving between claude.ai, Claude Desktop and Claude Code lands in
+the same sandboxes. Nothing that reaches the broker identifies a Claude conversation (verified
+exhaustively: Anthropic's `traceparent` scopes one assistant turn, Runlayer's ids scope one call).
+The workspace resolves in this order:
 
 1. the `workspace` argument on the tool call (explicit, chosen by you or by the model);
-2. the `X-Bashmcp-Workspace` request header (Runlayer forwards client headers verbatim);
+2. the optional `X-Bashmcp-Workspace` request header (Runlayer forwards client headers verbatim;
+   only Claude Code can set one, so avoid it if you move between clients);
 3. `"default"`.
 
-Claude Code can set the header in its MCP config, which pins a sandbox with no model involvement:
+Cross-client habit that works everywhere: name sandboxes after projects, and start a new
+conversation with `sandbox_list` (or tell Claude the name). Optional, Claude-Code-only pinning:
 
 ```bash
 # one sandbox per machine (user scope)
