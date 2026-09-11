@@ -30,6 +30,7 @@ Claude Code ──► Runlayer connector (manual OAuth 2.1 → Cognito, per-user
 ```
 broker/     FastMCP server: bash_exec, sandbox_list/status/pause/new/destroy  (+ Dockerfile)
 sandbox/    Ubuntu 24.04 image with dev tools + a no-op AgentCore entrypoint  (+ Dockerfile)
+runlayer.yaml  Runlayer Deploy manifest for the broker (hosting A)
 deploy/     build_push.sh, probe_sandbox.py, _common.py; standalone/ = original boto3 + Cognito path
 smoke.py    end-to-end test against the deployed broker
 ```
@@ -50,40 +51,57 @@ Each `bash_exec` is a fresh bash process: chain with `&&`/`;` for state. `HOME` 
 `/mnt` (apt installs, `/root`, running processes) is lost when the microVM stops. Bake tools into
 `sandbox/Dockerfile` instead.
 
-## Deploying (GitOps, recommended)
+## Deploying
 
-The firm's pattern for exposing an MCP server to Runlayer is a PrivateLink shim, so the
-broker runs on **eks-devops-nonprod** and only the sandbox runtime lives on AgentCore. Cognito
-is not needed: the broker verifies Runlayer's Identity Forward JWT (`x-runlayer-identity-token`,
-EdDSA, tenant JWKS) and takes the caller's email from it.
+Runlayer cannot call AgentCore directly (AgentCore accepts only SigV4 or an IdP JWT), so the
+broker is the piece in between. Two hostings are supported by the same image and code:
 
-| Repo / branch | Contents |
+### A. Broker on Runlayer Deploy (recommended, fewest moving parts)
+
+`runlayer.yaml` in this directory. Runlayer builds and runs the broker, registers it as a
+connector, injects identity per request, and gives the task an ECS role that may only
+`sts:AssumeRole` the customer role `bashmcp-broker-runlayer-nonprod` (ExternalId = deployment id).
+No EKS, no PrivateLink, no IRSA, no shim.
+
+| Where | What |
 |---|---|
-| `devops-live` `bashmcp-agentcore` | `us-east-1/nonprod/bashmcp-agentcore.tf`: ECR `devops/bashmcp-sandbox` + `devops/bashmcp-broker`, DynamoDB `bashmcp-sandboxes`, IRSA role `bashmcp-broker-nonprod`, sandbox runtime `bashmcp_sandbox_nonprod` (gated by `bashmcp-sandbox-enabled`); image tag in `bashmcp.auto.tfvars.json` |
-| `k8s-devops` `bashmcp-broker` | `apps/bashmcp/us-east-1/nonprod/bashmcp.yaml` + `appsets-nonprod/bashmcp.yaml`: Deployment, SA, HTTPRoutes on `eg` and `eg-privatelink`, health check |
-| `runlayer-shims-live` `bashmcp-shim` (local) | `environments/nonprod/bashmcp.yaml`: passthrough shim on the `mcp-test-nonprod` PrivateLink connection |
+| `devops-live` `us-east-1/nonprod/bashmcp-agentcore.tf` | ECR repos, DynamoDB `bashmcp-sandboxes`, sandbox runtime `bashmcp_sandbox_nonprod`, IAM roles (IRSA for EKS; Runlayer-trusted role gated on `bashmcp-runlayer-deployment-id`) |
+| this directory | `runlayer.yaml` (deployment manifest), `broker/` (image), `deploy/build_push.sh`, `deploy/probe_sandbox.py` |
 
-Rollout order (each step is a PR; `devops-live` applies on merge to master):
-
-1. `devops-live` PR with `bashmcp-sandbox-enabled: false` (plan appears on the PR; merge
-   applies): ECR repos, DynamoDB table, IRSA role.
-2. `bash deploy/build_push.sh --tag 0.1.0` pushes `devops/bashmcp-sandbox` (arm64) and
-   `devops/bashmcp-broker` (multi-arch) to the nonprod-account ECR (tags are immutable).
-3. Follow-up `devops-live` PR flipping `bashmcp-sandbox-enabled` to `true` creates the runtime.
-   Verify with `uv run deploy/probe_sandbox.py --name bashmcp_sandbox_nonprod`.
-4. `k8s-devops` PR (ArgoCD syncs; check `/healthz` on
-   `https://bashmcp.stoneridgeam-nonprod.cloud/healthz` from inside the VPC).
-5. `runlayer-shims-live`: run `uvx runlayer deploy init` once, paste the UUID into the YAML, PR;
-   merge deploys and registers the connector. Enable **Identity Forward (signed token)** on
-   the connector, grant access with `src/scripts/access.sh`, then set `RUNLAYER_AUDIENCE` to
-   `runlayer:identity-forward:<connector-id>` in the k8s manifest.
-6. `claude mcp add --transport http bashmcp https://stoneridge.runlayer.com/api/v1/proxy/<connector-id>/mcp`
+1. `uvx runlayer login --host https://stoneridge.runlayer.com`, then
+   `uvx runlayer deploy init --host https://stoneridge.runlayer.com --config runlayer.yaml`
+   (name `bashmcp`). Paste the issued UUID into `runlayer.yaml` `id:`.
+2. devops-live PR setting `bashmcp-runlayer-deployment-id` to that UUID in `bashmcp.auto.tfvars.json`
+   (merge applies; creates the role whose trust is pinned to Runlayer's per-deployment task role).
+3. `uvx runlayer deploy --config runlayer.yaml --host https://stoneridge.runlayer.com` from this
+   directory. First deploy activates the connector.
+4. In Runlayer: enable Identity Forward **signed identity token** on the connector, grant access.
+   Pin `RUNLAYER_AUDIENCE` in `runlayer.yaml` to `runlayer:identity-forward:<connector-id>` and redeploy.
+5. `claude mcp add --transport http bashmcp https://stoneridge.runlayer.com/api/v1/proxy/<connector-id>/mcp`
    and ask Claude Code to run something.
 
+### B. Broker on eks-devops-nonprod behind the PrivateLink shim (deployed first, works)
+
+`k8s-devops` `apps/bashmcp/us-east-1/nonprod` (Deployment, HTTPRoutes on `eg` and `eg-privatelink`)
+plus a passthrough shim in `runlayer-shims-live` `environments/nonprod/bashmcp.yaml`. Identity
+arrives the same way; AWS access is the IRSA role `bashmcp-broker-nonprod`. Costs an EKS app,
+the PrivateLink path (350 s NLB idle limit, so `MAX_TIMEOUT=300`), and the shim. Retire it once A
+is live: delete the k8s app and the IRSA role in follow-up PRs.
+
 Broker environment: `AUTH_MODE=runlayer`, `RUNLAYER_URL`, optional `RUNLAYER_AUDIENCE`,
-optional `BROKER_SHARED_BEARER` (pair with the shim's `UPSTREAM_BEARER`), `SANDBOX_RUNTIME_NAME`
-(resolved to an ARN at startup) or `SANDBOX_ARN`, `SANDBOX_TABLE`, `MAX_TIMEOUT` (300 in
-nonprod: the PrivateLink NLB idles out at 350 s and responses are not streamed).
+optional `BROKER_SHARED_BEARER`, `SANDBOX_RUNTIME_NAME` (resolved to an ARN at startup) or
+`SANDBOX_ARN`, `SANDBOX_TABLE`, `MAX_TIMEOUT`; for Runlayer hosting the role is picked up from
+`RUNLAYER_AWS_ROLE_BASHMCP` + `RUNLAYER_DEPLOYMENT_ID` (or `AWS_ASSUME_ROLE_ARN` +
+`AWS_ASSUME_ROLE_EXTERNAL_ID`).
+
+Images: `bash deploy/build_push.sh --tag <version>` pushes `devops/bashmcp-sandbox` (arm64) and
+`devops/bashmcp-broker` (multi-arch) to the nonprod-account ECR (immutable tags). The sandbox tag
+is pinned in devops-live `bashmcp.auto.tfvars.json`; bumping it wipes every session's workspace.
+Runlayer Deploy builds the broker image itself from `broker/Dockerfile`, so the ECR broker image
+is only needed for hosting B.
+
+Sandbox check with your own credentials (starts one microVM session):
+`uv run deploy/probe_sandbox.py --name bashmcp_sandbox_nonprod --profile aws-sr-am-admins@sr-es-devops-nonprod`.
 
 ## Standalone path (boto3 scripts, AgentCore-hosted broker)
 

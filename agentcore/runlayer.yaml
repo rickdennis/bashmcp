@@ -1,0 +1,57 @@
+# bashmcp broker hosted on Runlayer Deploy (nonprod tenant, stoneridge.runlayer.com).
+#
+# Runlayer builds broker/Dockerfile from this directory, runs it on Runlayer's
+# infrastructure, registers it as a connector, and injects per-request identity
+# (X-Runlayer-Identity-Token). AWS access: Runlayer gives the task a role that may
+# ONLY sts:AssumeRole the ARN below; the broker assumes it with
+# ExternalId = RUNLAYER_DEPLOYMENT_ID (both injected as env). That role lives in
+# devops-live us-east-1/nonprod/bashmcp-agentcore.tf, gated on
+# bashmcp-runlayer-deployment-id, which is the `id:` below.
+#
+# One-time, human (run from this directory):
+#   uvx runlayer login --host https://stoneridge.runlayer.com
+#   uvx runlayer deploy init --host https://stoneridge.runlayer.com --config runlayer.yaml   # name: bashmcp
+#     -> paste the issued UUID into `id:` below, and into devops-live
+#        bashmcp.auto.tfvars.json as bashmcp-runlayer-deployment-id (PR, merge = role created)
+# Every deploy:
+#   uvx runlayer deploy validate --config runlayer.yaml --host https://stoneridge.runlayer.com
+#   uvx runlayer deploy          --config runlayer.yaml --host https://stoneridge.runlayer.com
+# Then in Runlayer: enable Identity Forward "signed identity token" on the connector,
+# grant access, and pin RUNLAYER_AUDIENCE below to runlayer:identity-forward:<connector-id>.
+id: REPLACE-WITH-DEPLOY-INIT-UUID # backend-issued by `deploy init`; never let CI run init
+name: bashmcp
+
+runtime: docker
+
+build:
+  dockerfile: broker/Dockerfile
+  context: .
+  platform: arm
+
+service:
+  port: 8000
+  path: /mcp
+  expose: []
+
+infrastructure:
+  cpu: 512
+  memory: 1024
+  platform: arm
+  enable_db: false
+  aws:
+    assume_roles:
+      bashmcp: arn:aws:iam::558885799623:role/bashmcp-broker-runlayer-nonprod # -> env RUNLAYER_AWS_ROLE_BASHMCP
+
+env:
+  AUTH_MODE: runlayer
+  RUNLAYER_URL: $$RUNLAYER_URL # platform URL; JWKS + issuer derive from it
+  # RUNLAYER_AUDIENCE: runlayer:identity-forward:<connector-id>   # pin once the connector exists
+  SANDBOX_RUNTIME_NAME: bashmcp_sandbox_nonprod
+  SANDBOX_TABLE: bashmcp-sandboxes
+  AWS_REGION: us-east-1
+  AWS_DEFAULT_REGION: us-east-1
+  # No PrivateLink NLB in this path, so this is only bounded by Runlayer's proxy
+  # timeout (undocumented). Start at 300 s; raise after measuring.
+  MAX_TIMEOUT: "300"
+  SANDBOX_IDLE_SECONDS: "1800"
+  LOG_LEVEL: INFO

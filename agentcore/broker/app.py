@@ -19,6 +19,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from .awsauth import make_session
 from .auth import (
     AgentCoreJwtAuthenticator,
     Authenticator,
@@ -92,7 +93,7 @@ def resolve_sandbox_arn(session: boto3.session.Session, settings: Settings) -> s
 
 def _build_services() -> Services:
     settings = load_settings()
-    session = boto3.session.Session(region_name=settings.region)
+    session = make_session(settings.region)
     sandbox_arn = resolve_sandbox_arn(session, settings)
     table = session.resource("dynamodb").Table(settings.table_name)
     client = session.client(
