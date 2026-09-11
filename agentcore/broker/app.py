@@ -389,6 +389,49 @@ async def sandbox_destroy(ctx: Context, workspace: str = "default") -> str:
     )
 
 
+class RequestDumpMiddleware:
+    """TEMPORARY diagnostic (LOG_REQUEST_DUMP=1): log every HTTP request that reaches the broker,
+    with all header values (credentials redacted), query string, full JSON-RPC body and the
+    response status + headers. Sees initialize/tools/list traffic too, not just tool calls."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        headers = {}
+        for k, v in scope.get("headers", []):
+            lk = k.decode("latin-1").lower()
+            headers[lk] = f"<redacted {len(v)} bytes>" if lk in _REDACT else v.decode("latin-1", "replace")
+        messages, body = [], b""
+        while True:
+            msg = await receive()
+            messages.append(msg)
+            if msg["type"] != "http.request":
+                break
+            body += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+        rid = headers.get("x-request-id", "-")
+        log.info("REQDUMP[%s] %s %s?%s headers=%s body=%s", rid, scope.get("method"), scope.get("path"),
+                 scope.get("query_string", b"").decode("latin-1"), json.dumps(headers, sort_keys=True),
+                 body[:6000].decode("utf-8", "replace"))
+
+        async def replay():
+            if messages:
+                return messages.pop(0)
+            return await receive()
+
+        async def send_logged(message):
+            if message["type"] == "http.response.start":
+                resp_headers = {k.decode("latin-1").lower(): v.decode("latin-1", "replace") for k, v in message.get("headers", [])}
+                log.info("RESPDUMP[%s] status=%s headers=%s", rid, message.get("status"), json.dumps(resp_headers, sort_keys=True))
+            await send(message)
+
+        return await self.app(scope, replay, send_logged)
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -400,7 +443,14 @@ def main() -> None:
         services.settings.auth_mode, services.executor._arn, services.settings.table_name,
         services.settings.max_timeout, bool(services.settings.shared_bearer),
     )
-    mcp.run(transport="streamable-http")
+    if os.environ.get("LOG_REQUEST_DUMP"):
+        import uvicorn
+
+        log.warning("LOG_REQUEST_DUMP is on: logging every request's headers and body (credentials redacted)")
+        uvicorn.run(RequestDumpMiddleware(mcp.streamable_http_app()), host=mcp.settings.host, port=mcp.settings.port,
+                    log_level=mcp.settings.log_level.lower())
+    else:
+        mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":
