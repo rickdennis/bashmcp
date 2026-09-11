@@ -85,7 +85,7 @@ def main() -> None:
     parser.add_argument("--allow-broker-update", action="store_true", help="permit UpdateAgentRuntime on the broker")
     parser.add_argument("--sandbox-idle", type=int, default=1800, help="sandbox idle stop seconds (60-28800)")
     parser.add_argument("--broker-idle", type=int, default=900, help="broker idle stop seconds (60-28800)")
-    parser.add_argument("--max-timeout", type=int, default=600, help="broker bash_exec timeout cap (<=3600)")
+    parser.add_argument("--max-timeout", type=int, default=600, help="broker sandbox_exec timeout cap (<=3600)")
     args = parser.parse_args()
     dry = args.dry_run
     session = make_session(args)
@@ -145,7 +145,7 @@ def main() -> None:
             die("sandbox runtime ARN unknown; deploy the sandbox first")
         broker_params = {
             "agentRuntimeName": NAMES["broker_runtime"],
-            "description": "bashmcp broker: MCP bash_exec front door mapping Cognito users to sandbox sessions",
+            "description": "bashmcp broker: MCP sandbox_exec front door mapping Cognito users to sandbox sessions",
             "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": images["broker"]}},
             "roleArn": roles["broker"],
             "networkConfiguration": {"networkMode": "PUBLIC"},

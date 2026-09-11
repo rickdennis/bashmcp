@@ -1,7 +1,7 @@
 [project]
 name = "bashmcp-agentcore"
 version = "0.1.0"
-description = "bash_exec for Claude Code on Amazon Bedrock AgentCore: MCP broker + per-user sandbox runtime"
+description = "sandbox_exec for Claude Code on Amazon Bedrock AgentCore: MCP broker + per-user sandbox runtime"
 requires-python = ">=3.12"
 dependencies = [
     "boto3>=1.43",

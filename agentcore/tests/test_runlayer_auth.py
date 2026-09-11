@@ -134,7 +134,7 @@ async def test_tools_in_runlayer_mode(ddb_table, fake_client, keypair):
     try:
         fake_client.invoke_results = [events("hi\n")]
         ctx = FakeContext(FakeRequest({"x-runlayer-identity-token": keypair.mint()}))
-        out = json.loads(await app.bash_exec("echo hi", ctx=ctx))
+        out = json.loads(await app.sandbox_exec("echo hi", ctx=ctx))
         assert out["stdout"] == "hi\n"
         row = svc.registry.get("user-123", "default")
         assert row is not None and row.user_email == "rick@example.com"

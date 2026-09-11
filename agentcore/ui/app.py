@@ -211,7 +211,7 @@ def idle_seconds_of(item: dict[str, Any], now: datetime | None = None) -> int | 
 def infer_state(status: str | None, idle: int | None, idle_limit: int) -> str:
     """Same rule as deploy/list_sandboxes.py: an explicit pause wins; otherwise AgentCore stops the
     microVM after the runtime idle timeout, so long idle means 'likely stopped' (it resumes on the
-    next bash_exec, with /mnt/workspace intact)."""
+    next sandbox_exec, with /mnt/workspace intact)."""
     if status == "paused":
         return "paused"
     if idle is None:

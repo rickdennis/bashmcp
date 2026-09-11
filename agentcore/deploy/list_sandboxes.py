@@ -4,7 +4,7 @@
 AgentCore has no API to list runtime sessions, so the DynamoDB registry is the source of truth.
 "paused" means the broker stopped it on request; "likely stopped" is inferred from idle time
 against the runtime's idle timeout (default 30 min). A stopped sandbox resumes on its next
-bash_exec; its /mnt/workspace is kept for 14 idle days.
+sandbox_exec; its /mnt/workspace is kept for 14 idle days.
 
   uv run deploy/list_sandboxes.py [--profile P] [--region R] [--table bashmcp-sandboxes] [--idle 1800]
 """

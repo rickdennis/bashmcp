@@ -48,7 +48,7 @@ Or without Claude Code:
 
   curl -s http://localhost:${PORT}/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \\
     -H "Authorization: Bearer ${TOKEN}" \\
-    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash_exec","arguments":{"command":"id -u && hostname && echo hi > /mnt/workspace/local.txt"}}}'
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sandbox_exec","arguments":{"command":"id -u && hostname && echo hi > /mnt/workspace/local.txt"}}}'
 
 Ctrl-C stops the broker. Remove the MCP entry later with:  claude mcp remove bashmcp-local
 MSG

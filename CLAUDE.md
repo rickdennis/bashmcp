@@ -139,7 +139,7 @@ Interactive docs at `http://<host>:8080/docs`
 ## AgentCore Variant (`agentcore/`)
 
 `agentcore/` is a self-contained port of this project to **Amazon Bedrock AgentCore**: a FastMCP
-broker (`bash_exec` + `sandbox_*` tools) that drives per-user sandbox sessions on an AgentCore
+broker (`sandbox_exec` + the other `sandbox_*` tools) that drives per-user sandbox sessions on an AgentCore
 runtime via `InvokeAgentRuntimeCommand`, with `/mnt/workspace` persisted by session storage.
 Deployment: the broker runs on Runlayer Deploy (`agentcore/runlayer.yaml`, assumes an IAM role in
 the nonprod account); the sandbox runtime, registry table and roles are Terraform in devops-live

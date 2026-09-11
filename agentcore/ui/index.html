@@ -472,7 +472,7 @@
     const row = state.selected;
     if (!row || state.running) return;
     const who = (row.user_email || row.user_sub) + " / " + row.workspace;
-    if (!window.confirm("Pause (StopRuntimeSession) the sandbox " + who + "?\n\nThe microVM stops now; /mnt/workspace is kept and the sandbox resumes on its next bash_exec.")) return;
+    if (!window.confirm("Pause (StopRuntimeSession) the sandbox " + who + "?\n\nThe microVM stops now; /mnt/workspace is kept and the sandbox resumes on its next sandbox_exec.")) return;
     $("pause").disabled = true; $("run").disabled = true;
     try {
       const r = await fetch("/api/pause", {

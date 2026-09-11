@@ -2,8 +2,8 @@
 """End-to-end smoke test against the deployed broker (CHECKPOINT C: creates a real microVM session).
 
 Flow: Cognito USER_PASSWORD_AUTH on the "smoke" app client -> MCP streamable HTTP to the broker's
-invocation URL with the bearer token -> tools/list -> bash_exec writes a file and prints its uid ->
-sandbox_pause -> bash_exec reads the file back (persistence across stop/resume) -> quoting check ->
+invocation URL with the bearer token -> tools/list -> sandbox_exec writes a file and prints its uid ->
+sandbox_pause -> sandbox_exec reads the file back (persistence across stop/resume) -> quoting check ->
 sandbox_status/list -> optional --destroy.
 
 Usage: uv run smoke.py [--profile P] [--region R] [--workspace smoke] [--destroy] [--keep]
@@ -84,30 +84,30 @@ async def run(args: argparse.Namespace) -> int:
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools = sorted(t.name for t in (await session.list_tools()).tools)
-            check.ok(tools == ["bash_exec", "sandbox_destroy", "sandbox_list", "sandbox_new", "sandbox_pause", "sandbox_status"],
+            check.ok(tools == ["sandbox_destroy", "sandbox_exec", "sandbox_list", "sandbox_new", "sandbox_pause", "sandbox_status"],
                      "tools/list exposes the six tools", ", ".join(tools))
 
             t0 = time.monotonic()
-            r = text_of(await session.call_tool("bash_exec", {
+            r = text_of(await session.call_tool("sandbox_exec", {
                 "command": "id -u && uname -m && echo hello > /mnt/workspace/smoke.txt && df -h /mnt/workspace | tail -1",
                 "workspace": ws, "timeout": 120}))
             cold = time.monotonic() - t0
-            check.ok(r.get("returncode") == 0, "first bash_exec succeeds (cold start)", f"{cold:.1f}s, {json.dumps(r)[:300]}")
+            check.ok(r.get("returncode") == 0, "first sandbox_exec succeeds (cold start)", f"{cold:.1f}s, {json.dumps(r)[:300]}")
             check.ok(r.get("stdout", "").startswith("0\n"), "commands run as root (uid 0)", r.get("stdout", "")[:40].strip())
 
             t0 = time.monotonic()
-            r2 = text_of(await session.call_tool("bash_exec", {"command": "echo warm", "workspace": ws}))
+            r2 = text_of(await session.call_tool("sandbox_exec", {"command": "echo warm", "workspace": ws}))
             check.ok(r2.get("returncode") == 0 and r2.get("cold_start") is False,
-                     "second bash_exec is warm", f"{time.monotonic() - t0:.2f}s")
+                     "second sandbox_exec is warm", f"{time.monotonic() - t0:.2f}s")
 
-            r3 = text_of(await session.call_tool("bash_exec", {
+            r3 = text_of(await session.call_tool("sandbox_exec", {
                 "command": "mkdir -p '/mnt/workspace/a b' && echo ok", "workspace": ws}))
-            r4 = text_of(await session.call_tool("bash_exec", {
+            r4 = text_of(await session.call_tool("sandbox_exec", {
                 "command": "pwd", "working_dir": "/mnt/workspace/a b", "workspace": ws}))
             check.ok(r3.get("returncode") == 0 and r4.get("stdout", "").strip() == "/mnt/workspace/a b",
                      "working_dir with spaces is quoted correctly", r4.get("stdout", "").strip())
 
-            r5 = text_of(await session.call_tool("bash_exec", {
+            r5 = text_of(await session.call_tool("sandbox_exec", {
                 "command": "cd /nonexistent-dir-xyz", "working_dir": "/nonexistent-dir-xyz", "workspace": ws}))
             check.ok(r5.get("returncode") not in (0, None), "bad working_dir fails loudly", str(r5.get("returncode")))
 
@@ -120,7 +120,7 @@ async def run(args: argparse.Namespace) -> int:
             await asyncio.sleep(20)
 
             t0 = time.monotonic()
-            r6 = text_of(await session.call_tool("bash_exec", {
+            r6 = text_of(await session.call_tool("sandbox_exec", {
                 "command": "cat /mnt/workspace/smoke.txt && ls '/mnt/workspace/a b' >/dev/null && echo dir-ok",
                 "workspace": ws, "timeout": 120}))
             check.ok(r6.get("returncode") == 0 and r6.get("stdout", "").startswith("hello\n"),

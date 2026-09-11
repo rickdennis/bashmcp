@@ -1,6 +1,6 @@
 # bashmcp on Amazon Bedrock AgentCore
 
-`bash_exec` for Claude Code, hosted on AgentCore instead of a self-managed Firecracker/KVM box.
+`sandbox_exec` for Claude Code (the Firecracker server's `bash_exec`), hosted on AgentCore instead of a self-managed Firecracker/KVM box.
 Every caller gets a persistent, root-capable sandbox microVM; `/mnt/workspace` survives pauses.
 
 ```
@@ -28,7 +28,7 @@ Claude Code ──► Runlayer connector (manual OAuth 2.1 → Cognito, per-user
 ## Layout
 
 ```
-broker/     FastMCP server: bash_exec, sandbox_list/status/pause/new/destroy  (+ Dockerfile)
+broker/     FastMCP server: sandbox_exec, sandbox_list/status/pause/new/destroy  (+ Dockerfile)
 sandbox/    Ubuntu 24.04 image with dev tools + a no-op AgentCore entrypoint  (+ Dockerfile)
 runlayer.yaml  Runlayer Deploy manifest for the broker (hosting A)
 deploy/     build_push.sh, probe_sandbox.py, list_sandboxes.py, _common.py; standalone/ = original boto3 + Cognito path
@@ -40,14 +40,15 @@ smoke.py    end-to-end test against the deployed broker
 
 | Tool | What it does |
 |---|---|
-| `bash_exec(command, working_dir="/mnt/workspace", timeout=60, workspace="default")` | Runs `/bin/bash -lc` in your sandbox as root. Creates the sandbox on first use, resumes it if stopped. Returns `{stdout, stderr, returncode, elapsed_seconds, status, cold_start, runtime_session_id, workspace}`. |
+| `sandbox_exec(command, working_dir="/mnt/workspace", timeout=60, workspace="default")` | Runs `/bin/bash -lc` in your sandbox as root. Creates the sandbox on first use, resumes it if stopped. Returns `{stdout, stderr, returncode, elapsed_seconds, status, cold_start, runtime_session_id, workspace}`. |
 | `sandbox_list()` | Your workspaces. |
 | `sandbox_status(workspace)` | Metadata plus `likely_stopped` (inferred from idle time; AgentCore has no session status API). |
 | `sandbox_pause(workspace)` | `StopRuntimeSession` now. Files under `/mnt/workspace` are kept, processes are not. |
 | `sandbox_new(workspace, label)` | A fresh, empty sandbox under a new name. |
 | `sandbox_destroy(workspace)` | Stop and forget. Storage is reclaimed by AgentCore after 14 idle days. |
 
-Each `bash_exec` is a fresh bash process: chain with `&&`/`;` for state. `HOME` is redirected to
+`sandbox_exec` was named `bash_exec` until 2026-09-11 (the Firecracker server in the repo root keeps
+that name). Each `sandbox_exec` is a fresh bash process: chain with `&&`/`;` for state. `HOME` is redirected to
 `/mnt/workspace/.home` so dotfiles, git config and tool caches survive a pause. Anything outside
 `/mnt` (apt installs, `/root`, running processes) is lost when the microVM stops. Bake tools into
 `sandbox/Dockerfile` instead.
@@ -184,4 +185,4 @@ unless the model passes `workspace` explicitly (a project instruction is the rel
   forwards the ID token instead, switch the authorizer to `allowedAudience`.
 - Broker stickiness: if Runlayer does not replay AgentCore's `Mcp-Session-Id`, every call pays a
   broker cold start (latency only; the broker is stateless).
-- Runlayer/Claude Code HTTP timeouts may be shorter than the 600 s `bash_exec` cap.
+- Runlayer/Claude Code HTTP timeouts may be shorter than the 600 s `sandbox_exec` cap.

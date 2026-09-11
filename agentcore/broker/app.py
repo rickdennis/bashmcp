@@ -1,7 +1,7 @@
 """bashmcp broker: MCP server (streamable HTTP, stateless) for AgentCore Runtime.
 
-Tools mirror server.py's bash_exec plus the REST management surface, retargeted at
-AgentCore: one persistent sandbox session per (caller, workspace).
+sandbox_exec mirrors server.py's bash_exec and the sandbox_* tools mirror its REST management
+surface, retargeted at AgentCore: one persistent sandbox session per (caller, workspace).
 """
 from __future__ import annotations
 
@@ -118,7 +118,7 @@ def _build_services() -> Services:
 mcp = FastMCP(
     "bashmcp_broker",
     instructions=(
-        "Remote bash for Claude Code. bash_exec runs a command as root inside your own persistent "
+        "Remote bash for Claude Code. sandbox_exec runs a command as root inside your own persistent "
         "sandbox microVM; /mnt/workspace survives pauses. Use sandbox_* tools to manage workspaces."
     ),
     host="0.0.0.0",
@@ -167,7 +167,7 @@ def _identity(ctx: Context) -> Identity:
         _fingerprint(ctx, headers)
     if not _logged_first_request:
         # Once per process: which headers the proxy in front of us forwards (names only, never
-        # values) and the proxy's request timeout, which bounds how long bash_exec may run.
+        # values) and the proxy's request timeout, which bounds how long sandbox_exec may run.
         _logged_first_request = True
         names = sorted(k.lower() for k in headers.keys())
         timeout_ms = next((v for k, v in headers.items() if k.lower() == "x-envoy-expected-rq-timeout-ms"), None)
@@ -194,13 +194,13 @@ def _workspace(ctx: Context, requested: str | None) -> str:
 
 def _not_found(workspace: str) -> str:
     return error_json(
-        f"No sandbox named '{workspace}'. Run bash_exec (creates it on first use) or sandbox_new.",
+        f"No sandbox named '{workspace}'. Run sandbox_exec (creates it on first use) or sandbox_new.",
         workspace=workspace,
     )
 
 
 @mcp.tool(
-    name="bash_exec",
+    name="sandbox_exec",
     annotations={
         "title": "Execute a bash command in your AgentCore sandbox",
         "readOnlyHint": False,
@@ -209,7 +209,7 @@ def _not_found(workspace: str) -> str:
         "openWorldHint": True,
     },
 )
-async def bash_exec(
+async def sandbox_exec(
     command: str,
     ctx: Context,
     working_dir: str | None = None,
@@ -257,7 +257,7 @@ async def bash_exec(
     try:
         outcome = await asyncio.to_thread(svc.executor.run, sandbox.runtime_session_id, script, timeout)
     except SandboxError as exc:
-        log.warning("bash_exec failed user=%s workspace=%s error=%s", identity.display, workspace, exc)
+        log.warning("sandbox_exec failed user=%s workspace=%s error=%s", identity.display, workspace, exc)
         return error_json(
             f"Sandbox error: {exc}",
             workspace=workspace,
@@ -277,7 +277,7 @@ async def bash_exec(
 
     cold_start = created or sandbox.status in ("new", "paused") or outcome.attempts > 1
     log.info(
-        "bash_exec user=%s workspace=%s rc=%s status=%s elapsed=%.2fs attempts=%d cold=%s cmd=%r",
+        "sandbox_exec user=%s workspace=%s rc=%s status=%s elapsed=%.2fs attempts=%d cold=%s cmd=%r",
         identity.display, workspace, returncode, outcome.status, elapsed, outcome.attempts, cold_start,
         command[:200],
     )
@@ -332,7 +332,7 @@ async def sandbox_status(ctx: Context, workspace: str | None = None) -> str:
         likely_stopped=likely_stopped,
         note=(
             "AgentCore has no session status API; likely_stopped is inferred from idle time "
-            f"(idle timeout {svc.settings.idle_timeout}s). A stopped sandbox resumes on the next bash_exec."
+            f"(idle timeout {svc.settings.idle_timeout}s). A stopped sandbox resumes on the next sandbox_exec."
         ),
     )
 
@@ -342,7 +342,7 @@ async def sandbox_status(ctx: Context, workspace: str | None = None) -> str:
     annotations={"title": "Pause a sandbox", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
 )
 async def sandbox_pause(ctx: Context, workspace: str | None = None) -> str:
-    """Stop the sandbox's microVM now. /mnt/workspace is kept; processes are not. Resumes on next bash_exec."""
+    """Stop the sandbox's microVM now. /mnt/workspace is kept; processes are not. Resumes on next sandbox_exec."""
     svc = get_services()
     try:
         identity = _identity(ctx)

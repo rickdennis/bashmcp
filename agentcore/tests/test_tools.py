@@ -12,9 +12,9 @@ from tests.conftest import client_error, events, make_ctx, make_jwt
 TOKEN = make_jwt(sub="user-1", **{"cognito:username": "rick"}, email="rick@example.com")
 
 
-async def test_bash_exec_creates_sandbox_and_runs(services, fake_client):
+async def test_sandbox_exec_creates_sandbox_and_runs(services, fake_client):
     fake_client.invoke_results = [events("hello\n", "", 0), events("again\n", "", 0)]
-    first = json.loads(await app.bash_exec("echo hello", ctx=make_ctx(TOKEN)))
+    first = json.loads(await app.sandbox_exec("echo hello", ctx=make_ctx(TOKEN)))
     assert first["stdout"] == "hello\n"
     assert first["returncode"] == 0
     assert first["status"] == "COMPLETED"
@@ -27,7 +27,7 @@ async def test_bash_exec_creates_sandbox_and_runs(services, fake_client):
     assert sent["command"].endswith("echo hello'")
     assert "export HOME=/mnt/workspace/.home" in sent["command"]
 
-    second = json.loads(await app.bash_exec("echo again", ctx=make_ctx(TOKEN), working_dir="/mnt/workspace/a b", timeout=5))
+    second = json.loads(await app.sandbox_exec("echo again", ctx=make_ctx(TOKEN), working_dir="/mnt/workspace/a b", timeout=5))
     assert second["runtime_session_id"] == first["runtime_session_id"]
     assert second["cold_start"] is False
     inner = shlex.split(fake_client.invoke_calls[1]["body"]["command"])[2]
@@ -35,50 +35,50 @@ async def test_bash_exec_creates_sandbox_and_runs(services, fake_client):
     assert fake_client.invoke_calls[1]["body"]["timeout"] == 5
 
 
-async def test_bash_exec_isolated_per_user(services, fake_client):
-    a = json.loads(await app.bash_exec("id", ctx=make_ctx(make_jwt(sub="user-a"))))
-    b = json.loads(await app.bash_exec("id", ctx=make_ctx(make_jwt(sub="user-b"))))
+async def test_sandbox_exec_isolated_per_user(services, fake_client):
+    a = json.loads(await app.sandbox_exec("id", ctx=make_ctx(make_jwt(sub="user-a"))))
+    b = json.loads(await app.sandbox_exec("id", ctx=make_ctx(make_jwt(sub="user-b"))))
     assert a["runtime_session_id"] != b["runtime_session_id"]
 
 
-async def test_bash_exec_rejects_missing_auth(services):
-    out = json.loads(await app.bash_exec("id", ctx=make_ctx()))
+async def test_sandbox_exec_rejects_missing_auth(services):
+    out = json.loads(await app.sandbox_exec("id", ctx=make_ctx()))
     assert out["error"].startswith("Unauthorized")
 
 
-async def test_bash_exec_rejects_wrong_issuer(services):
-    out = json.loads(await app.bash_exec("id", ctx=make_ctx(make_jwt(sub="x", iss="https://evil.example"))))
+async def test_sandbox_exec_rejects_wrong_issuer(services):
+    out = json.loads(await app.sandbox_exec("id", ctx=make_ctx(make_jwt(sub="x", iss="https://evil.example"))))
     assert "issuer" in out["error"]
 
 
 @pytest.mark.parametrize("timeout", [0, -1, 601, 100000])
-async def test_bash_exec_timeout_bounds(services, timeout):
-    out = json.loads(await app.bash_exec("id", ctx=make_ctx(TOKEN), timeout=timeout))
+async def test_sandbox_exec_timeout_bounds(services, timeout):
+    out = json.loads(await app.sandbox_exec("id", ctx=make_ctx(TOKEN), timeout=timeout))
     assert "timeout must be between 1 and 600" in out["error"]
 
 
-async def test_bash_exec_empty_command(services):
-    out = json.loads(await app.bash_exec("   ", ctx=make_ctx(TOKEN)))
+async def test_sandbox_exec_empty_command(services):
+    out = json.loads(await app.sandbox_exec("   ", ctx=make_ctx(TOKEN)))
     assert "empty" in out["error"]
 
 
-async def test_bash_exec_invalid_workspace(services):
-    out = json.loads(await app.bash_exec("id", ctx=make_ctx(TOKEN), workspace="no spaces"))
+async def test_sandbox_exec_invalid_workspace(services):
+    out = json.loads(await app.sandbox_exec("id", ctx=make_ctx(TOKEN), workspace="no spaces"))
     assert "workspace" in out["error"]
 
 
-async def test_bash_exec_timed_out_marks_returncode(services, fake_client):
+async def test_sandbox_exec_timed_out_marks_returncode(services, fake_client):
     fake_client.invoke_results = [events("partial", "warn", None, "TIMED_OUT")]
-    out = json.loads(await app.bash_exec("sleep 99", ctx=make_ctx(TOKEN), timeout=1))
+    out = json.loads(await app.sandbox_exec("sleep 99", ctx=make_ctx(TOKEN), timeout=1))
     assert out["returncode"] == -1
     assert out["status"] == "TIMED_OUT"
     assert out["stdout"] == "partial"
     assert out["stderr"] == "warn\nCommand timed out"
 
 
-async def test_bash_exec_reports_sandbox_error(services, fake_client):
+async def test_sandbox_exec_reports_sandbox_error(services, fake_client):
     fake_client.invoke_results = [client_error("AccessDeniedException", "nope", 403)]
-    out = json.loads(await app.bash_exec("id", ctx=make_ctx(TOKEN)))
+    out = json.loads(await app.sandbox_exec("id", ctx=make_ctx(TOKEN)))
     assert "AccessDeniedException" in out["error"]
     assert out["workspace"] == "default"
     assert len(out["runtime_session_id"]) >= 33
@@ -107,7 +107,7 @@ async def test_sandbox_lifecycle(services, fake_client):
     assert status["likely_stopped"] is True and status["status"] == "paused"
 
     fake_client.invoke_results = [events("resumed\n")]
-    resumed = json.loads(await app.bash_exec("echo resumed", ctx, workspace="proj"))
+    resumed = json.loads(await app.sandbox_exec("echo resumed", ctx, workspace="proj"))
     assert resumed["cold_start"] is True and resumed["stdout"] == "resumed\n"
     assert json.loads(await app.sandbox_status(ctx, "proj"))["status"] == "active"
 
@@ -141,11 +141,11 @@ async def test_http_layer_forwards_authorization_header(services, fake_client):
                 "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
             assert listed.status_code == 200, listed.text
             names = sorted(t["name"] for t in listed.json()["result"]["tools"])
-            assert names == ["bash_exec", "sandbox_destroy", "sandbox_list", "sandbox_new", "sandbox_pause", "sandbox_status"]
+            assert names == ["sandbox_destroy", "sandbox_exec", "sandbox_list", "sandbox_new", "sandbox_pause", "sandbox_status"]
 
             called = await client.post("/mcp", headers=headers, json={
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": "bash_exec", "arguments": {"command": "echo via-http"}}})
+                "params": {"name": "sandbox_exec", "arguments": {"command": "echo via-http"}}})
             assert called.status_code == 200, called.text
             text = called.json()["result"]["content"][0]["text"]
             assert json.loads(text)["stdout"] == "via-http\n"
@@ -161,18 +161,18 @@ async def test_workspace_from_client_header(services, fake_client):
     """Runlayer forwards client headers verbatim; X-Bashmcp-Workspace picks the default sandbox."""
     hdr_ctx = make_ctx(TOKEN, headers={"x-bashmcp-workspace": "laptop-a"})
     fake_client.invoke_results = [events("a\n"), events("b\n"), events("c\n")]
-    a = json.loads(await app.bash_exec("echo a", ctx=hdr_ctx))
+    a = json.loads(await app.sandbox_exec("echo a", ctx=hdr_ctx))
     assert a["workspace"] == "laptop-a"
     # explicit argument beats the header
-    b = json.loads(await app.bash_exec("echo b", ctx=hdr_ctx, workspace="proj"))
+    b = json.loads(await app.sandbox_exec("echo b", ctx=hdr_ctx, workspace="proj"))
     assert b["workspace"] == "proj"
     # no header, no argument -> default
-    c = json.loads(await app.bash_exec("echo c", ctx=make_ctx(TOKEN)))
+    c = json.loads(await app.sandbox_exec("echo c", ctx=make_ctx(TOKEN)))
     assert c["workspace"] == "default"
     listing = json.loads(await app.sandbox_list(hdr_ctx))
     assert sorted(s["workspace"] for s in listing["sandboxes"]) == ["default", "laptop-a", "proj"]
     # management tools resolve the header the same way
     st = json.loads(await app.sandbox_status(hdr_ctx))
     assert st["workspace"] == "laptop-a"
-    bad = json.loads(await app.bash_exec("echo x", ctx=make_ctx(TOKEN, headers={"x-bashmcp-workspace": "no spaces!"})))
+    bad = json.loads(await app.sandbox_exec("echo x", ctx=make_ctx(TOKEN, headers={"x-bashmcp-workspace": "no spaces!"})))
     assert "workspace" in bad["error"]
