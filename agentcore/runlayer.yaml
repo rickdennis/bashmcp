@@ -45,7 +45,7 @@ infrastructure:
 env:
   AUTH_MODE: runlayer
   RUNLAYER_URL: $$RUNLAYER_URL # platform URL; JWKS + issuer derive from it
-  # RUNLAYER_AUDIENCE: runlayer:identity-forward:<connector-id>   # pin once the connector exists
+  RUNLAYER_AUDIENCE: runlayer:identity-forward:105fb9c5-bd09-4ea1-8e31-68bf8f89c7b5 # connector id of this deployment
   SANDBOX_RUNTIME_NAME: bashmcp_sandbox_nonprod
   SANDBOX_TABLE: bashmcp-sandboxes
   AWS_REGION: us-east-1
